@@ -14,12 +14,12 @@ class FlatMapBench {
 
 
   @Benchmark
-  def ioEitherT: Int = (ioCountdownEitherT(1000).value *> IO(1)).unsafeRunSync()
+  def ioEitherT: Int = (ioCountdownEitherT(100000).value *> IO(1)).unsafeRunSync()
 
 
   @Benchmark
   def bio: Int =
-    MonadError[BIO[Custom, ?], Custom].handleErrorWith(ioCountdownBIO(1000))(_ => BIO.pure(1)).unsafeRunSync()
+    MonadError[BIO[Custom, ?], Custom].handleErrorWith(ioCountdownBIO(100000))(_ => BIO.pure(1)).unsafeRunSync()
 
 
 

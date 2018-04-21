@@ -22,6 +22,8 @@ import cats._
 import cats.effect.bio.internals.{IOFrame, IOPlatform, IORunLoop, NonFatal}
 import cats.effect.bio.internals.IOPlatform.fusionMaxStackDepth
 import cats.effect.IO
+import cats.syntax.bifunctor._
+import cats.instances.either._
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration._
@@ -116,7 +118,16 @@ sealed abstract class BIO[E, +A] {
     }
 
   final def bimap[X, B](f: E => X, g: A => B): BIO[X, B] =
-    leftMap(f).map(g)
+    this match {
+      case BiMap(source, h, index) =>
+        // Allowed to do fixed number of map operations fused before
+        // resetting the counter in order to avoid stack overflows;
+        // See `IOPlatform` for details on this maximum.
+        if (index != fusionMaxStackDepth) BiMap(source, h.andThen(_.bimap(f, g)), index + 1)
+        else BiMap.bi(this, f, g, 0)
+      case _ =>
+        BiMap.bi(this, f, g, 0)
+    }
 
   /**
     * Monadic bind on `IO`, used for sequentially composing two `IO`
@@ -624,6 +635,9 @@ object BIO extends IOInstances {
 
     def left[X, Y, A](source: BIO[X, A], f: X => Y, index: Int): BiMap[X, Y, A, A] =
       BiMap(source, _.left.map(f), index)
+
+    def bi[A, B, C, D](source: BIO[A, C], f: A => B, g: C => D, index: Int): BiMap[A, B, C, D] =
+      BiMap(source, _.bimap(f, g), index)
   }
 
   /** Internal reference, used as an optimization for [[BIO.attempt]]

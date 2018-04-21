@@ -5,6 +5,12 @@ A Bifunctorial IO Implementation for Cats based on standard `cats.effect.IO`.
 
 ## Benchmarks
 
+The `BIO` included in this repo is `bio`.
+
+`ioEitherT` refers to `EitherT[cats.effect.IO, E, A]`.
+
+The Scalaz bifunctor IO (here nicknamed `zio`) is taken from here: https://github.com/scalaz/ioeffect
+
 ```
 [info] Benchmark               Mode  Cnt         Score         Error  Units
 [info] FlatMapBench.bio        avgt   15   7984481.602 ±  374087.511  ns/op

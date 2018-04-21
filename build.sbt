@@ -39,6 +39,6 @@ lazy val core = project.in(file(".")).settings(common)
 
 lazy val bench = project.in(file("bench")).settings(common).dependsOn(core).enablePlugins(JmhPlugin).settings(
   libraryDependencies ++= Seq(
-    //"org.scalaz" %% "scalaz-ioeffect" % "1.0.1-SNAPSHOT"
+    "org.scalaz" %% "scalaz-ioeffect" % "2.0.0"
   )
 )

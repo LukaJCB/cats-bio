@@ -436,7 +436,7 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
 
   implicit def ioSemigroup[E, A: Semigroup]: Semigroup[BIO[E, A]] = new IOSemigroup[E, A]
 
-  implicit def ioMonadError[E]: MonadError[BIO[E, ?], E] = new MonadError[BIO[E, ?], E] {
+  implicit def ioMonadError[E]: Bracket[BIO[E, ?], E] = new Bracket[BIO[E, ?], E] {
     override def pure[A](a: A): BIO[E, A] =
       BIO.pure(a)
     override def flatMap[A, B](ioa: BIO[E, A])(f: A => BIO[E, B]): BIO[E, B] =
@@ -457,6 +457,11 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
         case Left(a) => tailRecM(a)(f)
         case Right(b) => pure(b)
       }
+
+    override def bracketCase[A, B](acquire: BIO[E, A])
+                                  (use: A => BIO[E, B])
+                                  (release: (A, ExitCase[E]) => BIO[E, Unit]): BIO[E, B] =
+      IOBracket(acquire)(use)(release)
   }
 }
 

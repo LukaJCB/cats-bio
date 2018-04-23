@@ -18,32 +18,29 @@ package cats.effect.bio.internals
 
 import cats.effect.bio.BIO
 import cats.effect.ExitCase
-import scala.concurrent.CancellationException
 
 private[effect] object IOBracket {
-
-  private final val cancelException = new CancellationException("cancel in bracket")
 
   /**
     * Implementation for `IO.bracket`.
     */
-  def apply[A, B](acquire: BIO[Throwable, A])
-    (use: A => BIO[Throwable, B])
-    (release: (A, ExitCase[Throwable]) => BIO[Throwable, Unit]): BIO[Throwable, B] = {
+  def apply[E, A, B](acquire: BIO[E, A])
+    (use: A => BIO[E, B])
+    (release: (A, ExitCase[E]) => BIO[E, Unit]): BIO[E, B] = {
 
     acquire.flatMap { a =>
       BIO.Bind(
-        use(a).onCancelRaiseError(cancelException),
-        new ReleaseFrame[A, B](a, release))
+        use(a).onCancelRaiseError(null.asInstanceOf[E]),
+        new ReleaseFrame[E, A, B](a, release))
     }
   }
 
-  private final class ReleaseFrame[A, B](a: A,
-    release: (A, ExitCase[Throwable]) => BIO[Throwable, Unit])
-    extends IOFrame[Throwable, B, BIO[Throwable, B]] {
+  private final class ReleaseFrame[E, A, B](a: A,
+    release: (A, ExitCase[E]) => BIO[E, Unit])
+    extends IOFrame[E, B, BIO[E, B]] {
 
-    def recover(e: Throwable): BIO[Throwable, B] = {
-      if (e ne cancelException)
+    def recover(e: E): BIO[E, B] = {
+      if (e != null)
         release(a, ExitCase.error(e))
           .flatMap(new ReleaseRecover(e))
       else
@@ -51,22 +48,22 @@ private[effect] object IOBracket {
           .flatMap(Function.const(BIO.never))
     }
 
-    def apply(b: B): BIO[Throwable, B] =
+    def apply(b: B): BIO[E, B] =
       release(a, ExitCase.complete)
         .map(_ => b)
   }
 
-  private final class ReleaseRecover(e: Throwable)
-    extends IOFrame[Throwable, Unit, BIO[Throwable, Nothing]] {
+  private final class ReleaseRecover[E](e: E)
+    extends IOFrame[E, Unit, BIO[E, Nothing]] {
 
-    def recover(e2: Throwable): BIO[Throwable, Nothing] = {
+    def recover(e2: E): BIO[E, Nothing] = {
       // Logging the error somewhere, because exceptions
       // should never be silent
-      Logger.reportFailure(e2)
+      Logger.reportFailure(new IORunLoop.CustomException(e2))
       BIO.raiseError(e)
     }
 
-    def apply(a: Unit): BIO[Throwable, Nothing] =
+    def apply(a: Unit): BIO[E, Nothing] =
       BIO.raiseError(e)
   }
 }

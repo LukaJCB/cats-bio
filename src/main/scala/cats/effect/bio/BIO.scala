@@ -467,6 +467,10 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
 
 private[effect] abstract class IOInstances extends IOLowPriorityInstances {
 
+  implicit def ioBifunctor: Bifunctor[BIO] = new Bifunctor[BIO] {
+    def bimap[A, B, C, D](fab: BIO[A, B])(f: A => C, g: B => D): BIO[C, D] = fab.bimap(f, g)
+  }
+
   implicit def parApplicative[E <: AnyRef]: Applicative[BIO.Par[E, ?]] = new Applicative[BIO.Par[E, ?]] {
     import BIO.Par.unwrap
     import BIO.Par.{apply => par}

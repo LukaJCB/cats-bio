@@ -16,12 +16,8 @@
 
 package cats.effect.bio.internals
 
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.AbstractQueuedSynchronizer
-
-import cats.effect.bio._
-import cats.effect.bio.internals.IORunLoop.CustomException
-
+import cats.effect.bio.BIO
 import scala.concurrent.blocking
 import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.util.{Either, Try}
@@ -61,19 +57,8 @@ private[effect] object IOPlatform {
     ref match {
       case null => None
       case Right(a) => Some(a)
-      case Left(ex) => throw new CustomException[E](ex)
+      case Left(ex) => throw new IORunLoop.CustomException(ex)
     }
-  }
-
-  /**
-   * Given any side-effecting function, builds a new one
-   * that has the idempotency property, making sure that its
-   * side effects get triggered only once
-   */
-  def onceOnly[A](f: A => Unit): A => Unit = {
-    val wasCalled = new AtomicBoolean(false)
-
-    a => if (wasCalled.getAndSet(true)) () else f(a)
   }
 
   private final class OneShotLatch extends AbstractQueuedSynchronizer {
@@ -109,11 +94,15 @@ private[effect] object IOPlatform {
    *        ...
    * </pre>
    */
-  private[effect] final val fusionMaxStackDepth =
+  final val fusionMaxStackDepth =
     Option(System.getProperty("cats.effect.fusionMaxStackDepth", ""))
       .filter(s => s != null && s.nonEmpty)
       .flatMap(s => Try(s.toInt).toOption)
       .filter(_ > 0)
       .map(_ - 1)
       .getOrElse(127)
+
+  /** Returns `true` if the underlying platform is the JVM,
+    * `false` if it's JavaScript. */
+  final val isJVM = true
 }

@@ -1,5 +1,0 @@
-package bio
-
-class BiMapBench {
-
-}

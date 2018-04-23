@@ -1,5 +1,5 @@
 package bio
 
-object ZBIO {
+import scalaz.ioeffect.RTS
 
-}
+object ZBIO extends RTS

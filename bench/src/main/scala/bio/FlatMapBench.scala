@@ -2,13 +2,13 @@ package bio
 
 import cats.MonadError
 import cats.data.EitherT
-import cats.effect.IO
 import cats.effect.bio.BIO
+import cats.effect.IO
 import cats.syntax.all._
 import org.openjdk.jmh.annotations._
 import java.util.concurrent.TimeUnit
 
-import scalaz.ioeffect.{RTS, IO => ZIO}
+import scalaz.ioeffect.{IO => ZIO}
 
 @BenchmarkMode(Array(Mode.AverageTime))
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
@@ -21,7 +21,7 @@ class FlatMapBench {
 
   @Benchmark
   def bio: Int =
-    ioCountdownBIO(100000).attempt.flatMap(_ => BIO.pure(1)).unsafeRunSync()
+    ioCountdownBIO(100000).attempt[Custom].flatMap(_ => BIO.pure(1)).unsafeRunSync()
 
   @Benchmark
   def zio: Int =
@@ -50,5 +50,3 @@ class FlatMapBench {
   }
 
 }
-
-object ZBIO extends RTS

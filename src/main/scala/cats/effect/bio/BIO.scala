@@ -558,9 +558,9 @@ private[effect] abstract class IOInstances extends IOLowPriorityInstances {
     def empty = BIO.pure(Monoid[A].empty)
   }
 
-  implicit val ioSemigroupK: SemigroupK[BIO[Throwable, ?]] = new SemigroupK[BIO[Throwable, ?]] {
-    def combineK[A](a: BIO[Throwable, A], b: BIO[Throwable, A]): BIO[Throwable, A] =
-      ApplicativeError[BIO[Throwable, ?], Throwable].handleErrorWith(a)(_ => b)
+  implicit def ioSemigroupK[E]: SemigroupK[BIO[E, ?]] = new SemigroupK[BIO[E, ?]] {
+    def combineK[A](a: BIO[E, A], b: BIO[E, A]): BIO[E, A] =
+      ApplicativeError[BIO[E, ?], E].handleErrorWith(a)(_ => b)
   }
 }
 

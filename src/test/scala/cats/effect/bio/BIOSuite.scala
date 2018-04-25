@@ -5,13 +5,13 @@ import java.io.{ByteArrayOutputStream, PrintStream}
 import cats.effect.bio.BIO._
 import cats.effect.internals.NonFatal
 import cats.tests.CatsSuite
-
 import ArbitraryInstances._
 import cats.effect.laws.discipline.ConcurrentEffectTests
 import cats.effect.laws.util.TestContext
-import cats.laws.discipline.SemigroupalTests
+import cats.laws.discipline.{BifunctorTests, SemigroupKTests, SemigroupalTests}
 import org.typelevel.discipline.Laws
 import cats.effect.laws.util.TestInstances._
+import cats.kernel.laws.discipline.MonoidTests
 
 class BIOSuite extends CatsSuite with TestInstances {
 
@@ -49,6 +49,10 @@ class BIOSuite extends CatsSuite with TestInstances {
   implicit def bioIsomorphisms[E]: SemigroupalTests.Isomorphisms[BIO[E, ?]] =
     SemigroupalTests.Isomorphisms.invariant[BIO[E, ?]]
 
+  checkAllAsync("BIO", implicit ec => MonoidTests[BIO[String, Int]].monoid)
+  checkAllAsync("BIO", implicit ec => SemigroupKTests[BIO[String, ?]].semigroupK[Int])
+  checkAllAsync("BIO", implicit ec => BifunctorTests[BIO].bifunctor[Int, String, Int, String, Int, String])
   checkAllAsync("BIO[Throwable, ?]", implicit ec => ConcurrentEffectTests[BIO[Throwable, ?]].concurrentEffect[Int, Int, Int])
+
 
 }

@@ -27,7 +27,7 @@ private[effect] object IORunLoop {
   private type CallStack[E] = ArrayStack[Bind[E]]
   private type Callback[E] = Either[E, Any] => Unit
 
-  class CustomException[E](e: E) extends Exception(e.toString, null, true, false)
+  case class CustomException[E](e: E) extends Exception(e.toString, null, true, false)
 
   /**
    * Evaluates the given `IO` reference, calling the given callback

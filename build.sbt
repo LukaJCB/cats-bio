@@ -13,8 +13,10 @@ val common = Seq(
   crossScalaVersions := Seq("2.11.12", "2.12.4"),
 
   libraryDependencies ++= Seq(
-    "org.typelevel" %% "cats-core"       % "1.1.0",
-    "org.typelevel" %% "cats-effect"     % "1.0.0-RC"
+    "org.typelevel" %% "cats-core"        % "1.1.0",
+    "org.typelevel" %% "cats-testkit"     % "1.1.0" % Test,
+    "org.typelevel" %% "cats-effect"      % "1.0.0-RC",
+    "org.typelevel" %% "cats-effect-laws" % "1.0.0-RC"
   )
 )
 
@@ -24,7 +26,6 @@ scalacOptions in ThisBuild ++= Seq(
   "-encoding", "UTF-8", // yes, this is 2 args
   "-feature",
   "-unchecked",
-  "-Xfatal-warnings",
   "-Yno-adapted-args",
   "-Ywarn-dead-code"
 )

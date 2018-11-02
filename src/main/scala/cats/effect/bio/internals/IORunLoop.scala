@@ -22,10 +22,10 @@ import cats.effect.bio.BIO.{Async, Bind, Delay, Map, Pure, RaiseError, Suspend}
 import scala.collection.mutable.ArrayStack
 
 private[effect] object IORunLoop {
-  private type Current[E] = BIO[E, Any]
-  private type Bind[E] = Any => BIO[E, Any]
-  private type CallStack[E] = ArrayStack[Bind[E]]
-  private type Callback[E] = Either[E, Any] => Unit
+  private type Current = BIO[Any, Any]
+  private type Bind = Any => BIO[Any, Any]
+  private type CallStack = ArrayStack[Bind]
+  private type Callback = Either[Any, Any] => Unit
 
   case class CustomException[E](e: E) extends Exception(e.toString, null, true, false)
 
@@ -34,14 +34,14 @@ private[effect] object IORunLoop {
    * with the result when completed.
    */
   def start[E, A](source: BIO[E, A], cb: Either[E, A] => Unit): Unit =
-    loop(source, IOConnection.uncancelable, cb.asInstanceOf[Callback[E]], null, null, null)
+    loop(source, IOConnection.uncancelable, cb.asInstanceOf[Callback], null, null, null)
 
   /**
    * Evaluates the given `IO` reference, calling the given callback
    * with the result when completed.
    */
   def startCancelable[E, A](source: BIO[E, A], conn: IOConnection, cb: Either[E, A] => Unit): Unit =
-    loop(source, conn, cb.asInstanceOf[Callback[E]], null, null, null)
+    loop(source, conn, cb.asInstanceOf[Callback], null, null, null)
 
   /**
    * Loop for evaluating an `IO` value.
@@ -50,19 +50,19 @@ private[effect] object IORunLoop {
    * nullable values that can be supplied because the loop needs
    * to be resumed in [[RestartCallback]].
    */
-  private def loop[E](
-    source: Current[E],
+  private def loop(
+    source: Current,
     cancelable: IOConnection,
-    cb: Either[E, Any] => Unit,
-    rcbRef: RestartCallback[E],
-    bFirstRef: Bind[E],
-    bRestRef: CallStack[E]): Unit = {
+    cb: Either[Any, Any] => Unit,
+    rcbRef: RestartCallback,
+    bFirstRef: Bind,
+    bRestRef: CallStack): Unit = {
 
-    var currentIO: Current[E] = source
+    var currentIO: Current = source
     var conn: IOConnection = cancelable
-    var bFirst: Bind[E] = bFirstRef
-    var bRest: CallStack[E] = bRestRef
-    var rcb: RestartCallback[E] = rcbRef
+    var bFirst: Bind = bFirstRef
+    var bRest: CallStack = bRestRef
+    var rcb: RestartCallback = rcbRef
     // Values from Pure and Delay are unboxed in this var,
     // for code reuse between Pure and Delay
     var hasUnboxed: Boolean = false
@@ -75,7 +75,7 @@ private[effect] object IORunLoop {
             if (bRest eq null) bRest = new ArrayStack()
             bRest.push(bFirst)
           }
-          bFirst = bindNext.asInstanceOf[Bind[E]]
+          bFirst = bindNext.asInstanceOf[Bind]
           currentIO = fa
 
         case Pure(value) =>
@@ -95,7 +95,7 @@ private[effect] object IORunLoop {
           currentIO = try thunk() catch { case NonFatal(ex) => RaiseError(f(ex)) }
 
         case RaiseError(ex) =>
-          findErrorHandler(bFirst, bRest) match {
+          findErrorHandler[Any](bFirst, bRest) match {
             case null =>
               cb(Left(ex))
               return
@@ -110,12 +110,12 @@ private[effect] object IORunLoop {
             if (bRest eq null) bRest = new ArrayStack()
             bRest.push(bFirst)
           }
-          bFirst = bindNext.asInstanceOf[Bind[E]]
+          bFirst = bindNext.asInstanceOf[Bind]
           currentIO = fa
 
         case Async(register) =>
           if (conn eq null) conn = IOConnection()
-          if (rcb eq null) rcb = new RestartCallback(conn, cb.asInstanceOf[Callback[E]])
+          if (rcb eq null) rcb = new RestartCallback(conn, cb.asInstanceOf[Callback])
           rcb.prepare(bFirst, bRest)
           register(conn, rcb)
           return
@@ -142,9 +142,9 @@ private[effect] object IORunLoop {
    * boundary is hit.
    */
   def step[E, A](source: BIO[E, A]): BIO[E, A] = {
-    var currentIO: Current[E] = source
-    var bFirst: Bind[E] = null
-    var bRest: CallStack[E] = null
+    var currentIO: Current = source
+    var bFirst: Bind = null
+    var bRest: CallStack = null
     // Values from Pure and Delay are unboxed in this var,
     // for code reuse between Pure and Delay
     var hasUnboxed: Boolean = false
@@ -157,7 +157,7 @@ private[effect] object IORunLoop {
             if (bRest eq null) bRest = new ArrayStack()
             bRest.push(bFirst)
           }
-          bFirst = bindNext.asInstanceOf[Bind[E]]
+          bFirst = bindNext.asInstanceOf[Bind]
           currentIO = fa
 
         case Pure(value) =>
@@ -177,7 +177,7 @@ private[effect] object IORunLoop {
           currentIO = try thunk() catch { case NonFatal(ex) => RaiseError(f(ex)) }
 
         case RaiseError(ex) =>
-          findErrorHandler(bFirst, bRest) match {
+          findErrorHandler[Any](bFirst, bRest) match {
             case null =>
               return currentIO.asInstanceOf[BIO[E, A]]
             case bind =>
@@ -191,13 +191,13 @@ private[effect] object IORunLoop {
             if (bRest eq null) bRest = new ArrayStack()
             bRest.push(bFirst)
           }
-          bFirst = bindNext.asInstanceOf[Bind[E]]
+          bFirst = bindNext.asInstanceOf[Bind]
           currentIO = fa
 
         case Async(register) =>
           // Cannot inline the code of this method — as it would
           // box those vars in scala.runtime.ObjectRef!
-          return suspendInAsync(currentIO.asInstanceOf[BIO[E, A]], bFirst, bRest, register)
+          return suspendInAsync(currentIO, bFirst, bRest, register).asInstanceOf[BIO[E, A]]
       }
 
       if (hasUnboxed) {
@@ -218,18 +218,17 @@ private[effect] object IORunLoop {
     // $COVERAGE-ON$
   }
 
-  private def suspendInAsync[E, A](
-                                    currentIO: BIO[E, A],
-                                    bFirst: Bind[E],
-                                    bRest: CallStack[E],
-                                    register: (IOConnection, Either[E, Any] => Unit) => Unit): BIO[E, A] = {
+  private def suspendInAsync[E, A](currentIO: BIO[E, A],
+                                   bFirst: Bind,
+                                   bRest: CallStack,
+                                   register: (IOConnection, Either[E, Any] => Unit) => Unit): BIO[E, A] = {
 
     // Hitting an async boundary means we have to stop, however
     // if we had previous `flatMap` operations then we need to resume
     // the loop with the collected stack
     if (bFirst != null || (bRest != null && bRest.nonEmpty))
       Async { (conn, cb) =>
-        val rcb = new RestartCallback(conn, cb.asInstanceOf[Callback[E]])
+        val rcb = new RestartCallback(conn, cb.asInstanceOf[Callback])
         rcb.prepare(bFirst, bRest)
         register(conn, rcb)
       }
@@ -242,14 +241,14 @@ private[effect] object IORunLoop {
    * `IOFrame.ErrorHandler` references, because we know they won't do
    * anything — an optimization for `handleError`.
    */
-  private def popNextBind[E](bFirst: Bind[E], bRest: CallStack[E]): Bind[E] = {
-    if ((bFirst ne null) && !bFirst.isInstanceOf[IOFrame.ErrorHandler[E, _]])
+  private def popNextBind(bFirst: Bind, bRest: CallStack): Bind = {
+    if ((bFirst ne null) && !bFirst.isInstanceOf[IOFrame.ErrorHandler[_, _, _, _]])
       bFirst
     else if (bRest != null) {
-      var cursor: Bind[E] = null
+      var cursor: Bind = null
       while (cursor == null && bRest.nonEmpty) {
         val ref = bRest.pop()
-        if (!ref.isInstanceOf[IOFrame.ErrorHandler[E, _]]) cursor = ref
+        if (!ref.isInstanceOf[IOFrame.ErrorHandler[_, _, _, _]]) cursor = ref
       }
       cursor
     } else {
@@ -261,7 +260,7 @@ private[effect] object IORunLoop {
    * Finds a [[IOFrame]] capable of handling errors in our bind
    * call-stack, invoked after a `RaiseError` is observed.
    */
-  private def findErrorHandler[E](bFirst: Bind[E], bRest: CallStack[E]): IOFrame[E, Any, BIO[E, Any]] = {
+  private def findErrorHandler[E](bFirst: Bind, bRest: CallStack): IOFrame[E, Any, BIO[E, Any]] = {
     var result: IOFrame[E, Any, BIO[E, Any]] = null
     var cursor = bFirst
     var continue = true
@@ -291,20 +290,20 @@ private[effect] object IORunLoop {
    * It's an ugly, mutable implementation.
    * For internal use only, here be dragons!
    */
-  private final class RestartCallback[E](conn: IOConnection, cb: Callback[E])
-    extends Callback[E] {
+  private final class RestartCallback(conn: IOConnection, cb: Callback)
+    extends Callback {
 
     private[this] var canCall = false
-    private[this] var bFirst: Bind[E] = _
-    private[this] var bRest: CallStack[E] = _
+    private[this] var bFirst: Bind = _
+    private[this] var bRest: CallStack = _
 
-    def prepare(bFirst: Bind[E], bRest: CallStack[E]): Unit = {
+    def prepare(bFirst: Bind, bRest: CallStack): Unit = {
       canCall = true
       this.bFirst = bFirst
       this.bRest = bRest
     }
 
-    def apply(either: Either[E, Any]): Unit =
+    def apply(either: Either[Any, Any]): Unit =
       if (canCall) {
         canCall = false
         either match {

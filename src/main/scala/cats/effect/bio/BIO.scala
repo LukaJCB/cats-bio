@@ -83,7 +83,7 @@ import scala.util.{Failure, Left, Right, Success}
  *     }
  * }}}
  */
-sealed abstract class BIO[E, +A] {
+sealed abstract class BIO[+E, +A] {
   import BIO._
 
   /**
@@ -135,7 +135,7 @@ sealed abstract class BIO[E, +A] {
    * failures would be completely silent and `IO` references would
    * never terminate on evaluation.
    */
-  final def flatMap[B](f: A => BIO[E, B]): BIO[E, B] =
+  final def flatMap[E1 >: E, B](f: A => BIO[E1, B]): BIO[E1, B] =
     Bind(this, f)
 
   /**
@@ -188,7 +188,7 @@ sealed abstract class BIO[E, +A] {
    * @see [[runCancelable]] for the version that gives you a cancelable
    *      token that can be used to send a cancel signal
    */
-  final def runAsync(cb: Either[E, A] => BIO[E, Unit]): BIO[Throwable, Unit] = BIO {
+  final def runAsync(cb: Either[E, A] => BIO[Throwable, Unit]): BIO[Throwable, Unit] = BIO {
     unsafeRunAsync(cb.andThen(_.unsafeRunAsync(Callback.report)))
   }
 
@@ -229,7 +229,7 @@ sealed abstract class BIO[E, +A] {
    *
    * @see [[runAsync]] for the simple, uninterruptible version
    */
-  final def runCancelable(cb: Either[E, A] => BIO[E, Unit]): BIO[Throwable, BIO[Throwable, Unit]] = BIO {
+  final def runCancelable(cb: Either[E, A] => BIO[Throwable, Unit]): BIO[Throwable, BIO[Throwable, Unit]] = BIO {
     val cancel = unsafeRunCancelable(cb.andThen(_.unsafeRunAsync(_ => ())))
     BIO.Delay(cancel, identity)
   }
@@ -374,7 +374,7 @@ sealed abstract class BIO[E, +A] {
    * But you can use [[BIO.shift(implicit* IO.shift]] to force an async
    * boundary just before start.
    */
-  final def start: BIO[E, Fiber[BIO[E, ?], A @uncheckedVariance]] =
+  final def start[E1 >: E]: BIO[E1, Fiber[BIO[E1, ?], A @uncheckedVariance]] =
     IOStart(this)
 
 
@@ -388,7 +388,7 @@ sealed abstract class BIO[E, +A] {
    * non-terminating on cancelation into one that yields an error,
    * thus equivalent with [[BIO.raiseError]].
    */
-  final def onCancelRaiseError(e: E): BIO[E, A] =
+  final def onCancelRaiseError[E1 >: E](e: E1): BIO[E1, A] =
     IOCancel.raise(this, e)
 
   /**
@@ -398,6 +398,10 @@ sealed abstract class BIO[E, +A] {
   final def uncancelable: BIO[E, A] =
     IOCancel.uncancelable(this)
 
+  def catchAll[E1, B >: A](f: E => BIO[E1, B]): BIO[E1, B] = redeem(f)(BIO.pure[E1, B])
+
+  def redeem[E1, B](f: E => BIO[E1, B])(g: A => BIO[E1, B]): BIO[E1, B] =
+    BIO.Bind(this, IOFrame.redeemer(f, g))
 
   override def toString = this match {
     case Pure(a) => s"IO($a)"
@@ -436,7 +440,7 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
 
   implicit def ioSemigroup[E, A: Semigroup]: Semigroup[BIO[E, A]] = new IOSemigroup[E, A]
 
-  implicit def ioMonadError[E]: Bracket[BIO[E, ?], E] = new Bracket[BIO[E, ?], E] {
+  implicit def ioBracket[E]: Bracket[BIO[E, ?], E] = new Bracket[BIO[E, ?], E] {
     override def pure[A](a: A): BIO[E, A] =
       BIO.pure(a)
     override def flatMap[A, B](ioa: BIO[E, A])(f: A => BIO[E, B]): BIO[E, B] =
@@ -448,7 +452,7 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
     override def attempt[A](ioa: BIO[E, A]): BIO[E, Either[E, A]] =
       ioa.attempt
     override def handleErrorWith[A](ioa: BIO[E, A])(f: E => BIO[E, A]): BIO[E, A] =
-      BIO.Bind(ioa, IOFrame.errorHandler(f))
+      BIO.Bind(ioa, IOFrame.redeemer(f, BIO.pure[E, A]))
     override def raiseError[A](e: E): BIO[E, A] =
       BIO.raiseError(e)
 
@@ -459,8 +463,8 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
       }
 
     override def bracketCase[A, B](acquire: BIO[E, A])
-                                  (use: A => BIO[E, B])
-                                  (release: (A, ExitCase[E]) => BIO[E, Unit]): BIO[E, B] =
+      (use: A => BIO[E, B])
+      (release: (A, ExitCase[E]) => BIO[E, Unit]): BIO[E, B] =
       IOBracket(acquire)(use)(release)
   }
 }
@@ -503,7 +507,7 @@ private[effect] abstract class IOInstances extends IOLowPriorityInstances {
     override def attempt[A](ioa: BIO[Throwable, A]): BIO[Throwable, Either[Throwable, A]] =
       ioa.attempt
     override def handleErrorWith[A](ioa: BIO[Throwable, A])(f: Throwable => BIO[Throwable, A]): BIO[Throwable, A] =
-      BIO.Bind(ioa, IOFrame.errorHandler(f))
+      BIO.Bind(ioa, IOFrame.redeemer(f, BIO.pure[Throwable, A]))
     override def raiseError[A](e: Throwable): BIO[Throwable, A] =
       BIO.raiseError(e)
     override def suspend[A](thunk: => BIO[Throwable, A]): BIO[Throwable, A] =
@@ -543,7 +547,7 @@ private[effect] abstract class IOInstances extends IOLowPriorityInstances {
       override def applicative: Applicative[BIO.Par[E, ?]] =
         parApplicative
       override def monad: Monad[BIO[E, ?]] =
-        ioMonadError
+        ioBracket
       override val sequential: ~>[BIO.Par[E, ?], BIO[E, ?]] =
         new FunctionK[BIO.Par[E, ?], BIO[E, ?]] {
           def apply[A](fa: BIO.Par[E, A]): BIO[E, A] = BIO.Par.unwrap(fa)
@@ -764,7 +768,7 @@ object BIO extends IOInstances {
   /**
    * Builds a cancelable `IO`.
    */
-  def cancelable[E, A](k: (Either[E, A] => Unit) => BIO[E, Unit]): BIO[E, A] =
+  def cancelable[E, A](k: (Either[E, A] => Unit) => BIO[Throwable, Unit]): BIO[E, A] =
     Async[E, A] { (conn, cb) =>
       val cb2 = Callback.asyncIdempotent(conn, cb)
       val ref = ForwardCancelable()
@@ -1031,8 +1035,8 @@ object BIO extends IOInstances {
   private[effect] final case class Suspend[E, +A](thunk: () => BIO[E, A], f: Throwable => E)
     extends BIO[E, A]
 
-  private[effect] final case class Bind[R, E, +A](source: BIO[E, R], f: R => BIO[E, A])
-    extends BIO[E, A]
+  private[effect] final case class Bind[R, E, E1, +A](source: BIO[E, R], f: R => BIO[E1, A])
+    extends BIO[E1, A]
 
   private[effect] final case class Async[E, +A](k: (IOConnection, Either[E, A] => Unit) => Unit)
     extends BIO[E, A]

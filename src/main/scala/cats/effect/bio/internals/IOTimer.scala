@@ -1,5 +1,7 @@
+package cats.effect.bio.internals
+
 /*
- * Copyright (c) 2017-2018 The Typelevel Cats-effect Project Developers
+ * Copyright (c) 2017-2019 The Typelevel Cats-effect Project Developers
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,76 +16,82 @@
  * limitations under the License.
  */
 
-package cats.effect.bio
-package internals
-
 import java.util.concurrent.{Executors, ScheduledExecutorService, ThreadFactory}
-import cats.effect.Timer
+
+import cats.effect.bio.BIO
+import cats.effect.bio.internals.Callback.T
+import cats.effect.bio.internals.IOShift.Tick
+import cats.effect.{Clock, Timer}
+
 import scala.concurrent.ExecutionContext
-import scala.concurrent.duration.{FiniteDuration, MILLISECONDS, NANOSECONDS, TimeUnit}
+import scala.concurrent.duration.FiniteDuration
 
 /**
- * Internal API — JVM specific implementation of a `Timer[BIO]`.
- *
- * Depends on having a Scala `ExecutionContext` for the actual
- * execution of tasks (i.e. bind continuations) and on a Java
- * `ScheduledExecutorService` for scheduling ticks with a delay.
- */
-private[internals] final class IOTimer private (ec: ExecutionContext, sc: ScheduledExecutorService)
-  extends Timer[BIO[Throwable, ?]] {
+  * Internal API — JVM specific implementation of a `Timer[IO]`.
+  *
+  * Depends on having a Scala `ExecutionContext` for the
+  * execution of tasks after their schedule (i.e. bind continuations) and on a Java
+  * `ScheduledExecutorService` for scheduling ticks with a delay.
+  */
+private[internals] final class IOTimer[E] private (ec: ExecutionContext, sc: ScheduledExecutorService, val clock: Clock[BIO[E, ?]])
+  extends Timer[BIO[E, ?]] {
 
   import IOTimer._
 
-  override def clockRealTime(unit: TimeUnit): BIO[Throwable, Long] =
-    BIO(unit.convert(System.currentTimeMillis(), MILLISECONDS))
-
-  override def clockMonotonic(unit: TimeUnit): BIO[Throwable, Long] =
-    BIO(unit.convert(System.nanoTime(), NANOSECONDS))
-
-  override def sleep(timespan: FiniteDuration): BIO[Throwable, Unit] =
-    BIO.cancelable { cb =>
-      val f = sc.schedule(new ShiftTick(cb, ec), timespan.length, timespan.unit)
-      BIO(f.cancel(false))
-    }
-
-  override def shift: BIO[Throwable, Unit] =
-    BIO.async(cb => ec.execute(new Tick(cb)))
+  override def sleep(timespan: FiniteDuration): BIO[E, Unit] =
+    BIO.Async(new IOForkedStart[E, Unit] {
+      def apply(conn: IOConnection[E], cb: T[E, Unit]): Unit = {
+        // Doing what IO.cancelable does
+        val ref = ForwardCancelable()
+        conn.push(ref.cancel)
+        // Race condition test
+        if (!conn.isCanceled) {
+          val f = sc.schedule(new ShiftTick(conn, cb, ec), timespan.length, timespan.unit)
+          ref.complete(BIO.unsafeDelay(f.cancel(false)))
+        } else {
+          ref.complete(BIO.unit)
+        }
+      }
+    })
 }
 
 private[internals] object IOTimer {
   /** Builder. */
-  def apply(ec: ExecutionContext): Timer[BIO[Throwable, ?]] =
-    apply(ec, scheduler)
+  def apply[E](ec: ExecutionContext, clock: Clock[BIO[E, ?]]): Timer[BIO[E, ?]] =
+    apply(ec, scheduler, clock)
 
   /** Builder. */
-  def apply(ec: ExecutionContext, sc: ScheduledExecutorService): Timer[BIO[Throwable, ?]] =
-    new IOTimer(ec, scheduler)
+  def apply[E](ec: ExecutionContext, sc: ScheduledExecutorService, clock: Clock[BIO[E, ?]]): Timer[BIO[E, ?]] =
+    new IOTimer(ec, sc, clock)
 
-  private lazy val scheduler: ScheduledExecutorService =
+  /** Global instance, used by `IOApp`. */
+//  lazy val global: Timer[BIO[Nothing, ?]] =
+//    apply(ExecutionContext.Implicits.global)
+
+  private[internals] lazy val scheduler: ScheduledExecutorService =
     Executors.newScheduledThreadPool(2, new ThreadFactory {
       def newThread(r: Runnable): Thread = {
         val th = new Thread(r)
-        th.setName("cats-effect")
+        th.setName(s"cats-effect-scheduler-${th.getId}")
         th.setDaemon(true)
         th
       }
     })
 
-  private final class ShiftTick(
-                                 cb: Either[Throwable, Unit] => Unit, ec: ExecutionContext)
+  private final class ShiftTick[E](
+                                 conn: IOConnection[E],
+                                 cb: Either[E, Unit] => Unit,
+                                 ec: ExecutionContext)
     extends Runnable {
-    def run() = {
+
+    def run(): Unit = {
       // Shifts actual execution on our `ExecutionContext`, because
       // the scheduler is in charge only of ticks and the execution
       // needs to shift because the tick might continue with whatever
       // bind continuation is linked to it, keeping the current thread
       // occupied
+      conn.pop()
       ec.execute(new Tick(cb))
     }
-  }
-
-  private final class Tick(cb: Either[Throwable, Unit] => Unit)
-    extends Runnable {
-    def run() = cb(Callback.rightUnit)
   }
 }

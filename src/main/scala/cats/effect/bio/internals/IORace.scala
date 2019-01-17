@@ -1,5 +1,7 @@
+package cats.effect.bio.internals
+
 /*
- * Copyright (c) 2017-2018 The Typelevel Cats-effect Project Developers
+ * Copyright (c) 2017-2019 The Typelevel Cats-effect Project Developers
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,127 +16,158 @@
  * limitations under the License.
  */
 
-package cats.effect.bio.internals
 
 import java.util.concurrent.atomic.AtomicBoolean
 
-import cats.effect.bio.internals.Callback.{Extensions, Type => Callback}
+import cats.effect.{ContextShift, Fiber}
 import cats.effect.bio.BIO
-import cats.effect.Fiber
+import cats.effect.bio.internals.IORunLoop.CustomException
+import cats.effect.internals.Logger
+
 import scala.concurrent.Promise
 
 private[effect] object IORace {
   /**
-   * Implementation for `BIO.race` - could be described with `racePair`,
-   * but this way it is more efficient, as we no longer have to keep
-   * internal promises.
-   */
-  def simple[E, A, B](lh: BIO[E, A], rh: BIO[E, B]): BIO[E, Either[A, B]] = {
+    * Implementation for `IO.race` - could be described with `racePair`,
+    * but this way it is more efficient, as we no longer have to keep
+    * internal promises.
+    */
+  def simple[E, A, B](cs: ContextShift[BIO[E, ?]], lh: BIO[E, A], rh: BIO[E, B]): BIO[E, Either[A, B]] = {
     // Signals successful results
     def onSuccess[T, U](
-      isActive: AtomicBoolean,
-      other: IOConnection,
-      cb: Callback[E, Either[T, U]],
-      r: Either[T, U]): Unit = {
+                         isActive: AtomicBoolean,
+                         main: IOConnection[E],
+                         other: IOConnection[E],
+                         cb: Callback.T[E, Either[T, U]],
+                         r: Either[T, U]): Unit = {
 
       if (isActive.getAndSet(false)) {
         // First interrupts the other task
-        try other.cancel()
-        finally cb.async(Right(r))
+        other.cancel.unsafeRunAsync { r2 =>
+          main.pop()
+          cb(Right(r))
+          maybeReport(r2)
+        }
       }
     }
 
     def onError[T](
-      active: AtomicBoolean,
-      cb: Callback.Type[E, T],
-      other: IOConnection,
-      err: E): Unit = {
+                    active: AtomicBoolean,
+                    cb: Callback.T[E, T],
+                    main: IOConnection[E],
+                    other: IOConnection[E],
+                    err: E): Unit = {
 
       if (active.getAndSet(false)) {
-        try other.cancel()
-        finally cb.async(Left(err))
+        other.cancel.unsafeRunAsync { r2 =>
+          main.pop()
+          maybeReport(r2)
+          cb(Left(err))
+        }
       } else {
-        Logger.reportFailure(new IORunLoop.CustomException(err))
+        Logger.reportFailure(CustomException(err))
       }
     }
 
-    BIO.cancelable { cb =>
+    val start: Start[E, Either[A, B]] = (conn, cb) => {
       val active = new AtomicBoolean(true)
       // Cancelable connection for the left value
-      val connL = IOConnection()
+      val connL = IOConnection[E]()
       // Cancelable connection for the right value
-      val connR = IOConnection()
+      val connR = IOConnection[E]()
+      // Registers both for cancellation — gets popped right
+      // before callback is invoked in onSuccess / onError
+      conn.pushPair(connL, connR)
 
       // Starts concurrent execution for the left value
-      IORunLoop.startCancelable[E, A](lh, connL, {
+      IORunLoop.startCancelable[E, A](IOForkedStart(lh, cs), connL, {
         case Right(a) =>
-          onSuccess(active, connR, cb, Left(a))
+          onSuccess(active, conn, connR, cb, Left(a))
         case Left(err) =>
-          onError(active, cb, connR, err)
+          onError(active, cb, conn, connR, err)
       })
 
       // Starts concurrent execution for the right value
-      IORunLoop.startCancelable[E, B](rh, connR, {
+      IORunLoop.startCancelable[E, B](IOForkedStart(rh, cs), connR, {
         case Right(b) =>
-          onSuccess(active, connL, cb, Right(b))
+          onSuccess(active, conn, connL, cb, Right(b))
         case Left(err) =>
-          onError(active, cb, connL, err)
+          onError(active, cb, conn, connL, err)
       })
-
-      // Composite cancelable that cancels both
-      BIO.unsafeNoCatch(Cancelable.cancelAll(connL.cancel, connR.cancel))
     }
+
+    BIO.Async(start, trampolineAfter = true)
   }
 
+  type Pair[E, A, B] = Either[(A, Fiber[BIO[E, ?], B]), (Fiber[BIO[E, ?], A], B)]
+
   /**
-   * Implementation for `BIO.racePair`
-   */
-  def pair[E, A, B](lh: BIO[E, A], rh: BIO[E, B]): BIO[E, Either[(A, Fiber[BIO[E, ?], B]), (Fiber[BIO[E, ?], A], B)]] = {
-    BIO.cancelable { cb =>
+    * Implementation for `IO.racePair`
+    */
+  def pair[E, A, B](cs: ContextShift[BIO[E, ?]], lh: BIO[E, A], rh: BIO[E, B]): BIO[E, Pair[E, A, B]] = {
+    val start: Start[E, Pair[E, A, B]] = (conn, cb) => {
       val active = new AtomicBoolean(true)
       // Cancelable connection for the left value
-      val connL = IOConnection()
+      val connL = IOConnection[E]()
       val promiseL = Promise[Either[E, A]]()
       // Cancelable connection for the right value
-      val connR = IOConnection()
+      val connR = IOConnection[E]()
       val promiseR = Promise[Either[E, B]]()
 
-      // Starts concurrent execution for the left value
-      IORunLoop.startCancelable[E, A](lh, connL, {
-        case Right(a) =>
-          if (active.getAndSet(false))
-            cb.async(Right(Left((a, IOFiber.build[E, B](promiseR, connR)))))
-          else
-            promiseL.trySuccess(Right(a))
+      // Registers both for cancellation — gets popped right
+      // before callback is invoked in onSuccess / onError
+      conn.pushPair(connL, connR)
 
+      // Starts concurrent execution for the left value
+      IORunLoop.startCancelable[E, A](IOForkedStart(lh, cs), connL, {
+        case Right(a) =>
+          if (active.getAndSet(false)) {
+            conn.pop()
+            cb(Right(Left((a, IOStart.fiber[E, B](promiseR, connR)))))
+          } else {
+            promiseL.trySuccess(Right(a))
+          }
         case Left(err) =>
           if (active.getAndSet(false)) {
-            cb.async(Left(err))
-            connR.cancel()
+            connR.cancel.unsafeRunAsync { r2 =>
+              conn.pop()
+              maybeReport(r2)
+              cb(Left(err))
+            }
           } else {
             promiseL.trySuccess(Left(err))
           }
       })
 
       // Starts concurrent execution for the right value
-      IORunLoop.startCancelable[E, B](rh, connR, {
+      IORunLoop.startCancelable[E, B](IOForkedStart(rh, cs), connR, {
         case Right(b) =>
-          if (active.getAndSet(false))
-            cb.async(Right(Right((IOFiber.build[E, A](promiseL, connL), b))))
-          else
+          if (active.getAndSet(false)) {
+            conn.pop()
+            cb(Right(Right((IOStart.fiber[E, A](promiseL, connL), b))))
+          } else {
             promiseR.trySuccess(Right(b))
+          }
 
         case Left(err) =>
           if (active.getAndSet(false)) {
-            cb.async(Left(err))
-            connL.cancel()
+            connL.cancel.unsafeRunAsync { r2 =>
+              conn.pop()
+              maybeReport(r2)
+              cb(Left(err))
+            }
           } else {
             promiseR.trySuccess(Left(err))
           }
       })
-
-      // Composite cancelable that cancels both
-      BIO.unsafeNoCatch(Cancelable.cancelAll(connL.cancel, connR.cancel))
     }
+
+    BIO.Async(start, trampolineAfter = true)
   }
+
+  private[this] def maybeReport[E](r: Either[E, _]): Unit =
+    r match {
+      case Left(e) => Logger.reportFailure(CustomException(e))
+      case _ => ()
+    }
 }

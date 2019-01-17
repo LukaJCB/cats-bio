@@ -1,5 +1,9 @@
+package cats.effect.bio.internals
+
+import cats.effect.bio.BIO
+
 /*
- * Copyright (c) 2017-2018 The Typelevel Cats-effect Project Developers
+ * Copyright (c) 2017-2019 The Typelevel Cats-effect Project Developers
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,21 +18,18 @@
  * limitations under the License.
  */
 
-package cats.effect.bio.internals
-
-import cats.effect.bio.BIO
 
 /** A mapping function that is also able to handle errors,
- * being the equivalent of:
- *
- * ```
- * Either[Throwable, A] => R
- * ```
- *
- * Internal to `IO`'s implementations, used to specify
- * error handlers in their respective `Bind` internal states.
- */
-private[effect] abstract class IOFrame[E, -A, +R]
+  * being the equivalent of:
+  *
+  * ```
+  * Either[Throwable, A] => R
+  * ```
+  *
+  * Internal to `IO`'s implementations, used to specify
+  * error handlers in their respective `Bind` internal states.
+  */
+private[effect] abstract class  IOFrame[E, -A, +R]
   extends (A => R) { self =>
 
   def apply(a: A): R
@@ -42,13 +43,29 @@ private[effect] abstract class IOFrame[E, -A, +R]
 }
 
 private[effect] object IOFrame {
-  def redeemer[E, E1, A, A1](f: E => BIO[E1, A1], g: A => BIO[E1, A1]): IOFrame[E, A, BIO[E1, A1]] =
-    new ErrorHandler[E, E1, A, A1](f, g)
-
-  final class ErrorHandler[E, E1, A, A1](f: E => BIO[E1, A1], g: A => BIO[E1, A1])
+  /** [[IOFrame]] reference that only handles errors, useful for
+    * quick filtering of `onErrorHandleWith` frames.
+    */
+  final class ErrorHandler[E, E1, A, A1](fe: E => BIO[E1, A1], g: A => BIO[E1, A1])
     extends IOFrame[E, A, BIO[E1, A1]] {
 
-    def recover(e: E): BIO[E1, A1] = f(e)
+    def recover(e: E): BIO[E1, A1] = fe(e)
     def apply(a: A): BIO[E1, A1] = g(a)
+  }
+
+  /** Used by [[BIO.redeem]]. */
+  final class Redeem[E, A, B](fe: E => B, fs: A => B)
+    extends IOFrame[E, A, BIO[E, B]] {
+
+    def apply(a: A): BIO[E, B] = BIO.pure(fs(a))
+    def recover(e: E): BIO[E, B] = BIO.pure(fe(e))
+  }
+
+  /** Used by [[BIO.redeemWith]]. */
+  final class RedeemWith[E, A, B](fe: E => BIO[E, B], fs: A => BIO[E, B])
+    extends IOFrame[E, A, BIO[E, B]] {
+
+    def apply(a: A): BIO[E, B] = fs(a)
+    def recover(e: E): BIO[E, B] = fe(e)
   }
 }

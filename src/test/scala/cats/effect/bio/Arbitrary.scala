@@ -37,7 +37,7 @@ object ArbitraryInstances {
     getArbitrary[A].map(BIO.pure)
 
   def genApply[E: Arbitrary, A: Arbitrary]: Gen[BIO[E, A]] =
-    getArbitrary[A].map(BIO.unsafeNoCatch(_))
+    getArbitrary[A].map(BIO.unsafeDelay(_))
 
   def genFail[E: Arbitrary, A]: Gen[BIO[E, A]] =
     getArbitrary[E].map(BIO.raiseError)
@@ -50,7 +50,7 @@ object ArbitraryInstances {
       .map(k => BIO.async(k).flatMap(x => x))
 
   def genBindSuspend[E: Arbitrary, A: Arbitrary: Cogen]: Gen[BIO[E, A]] =
-    getArbitrary[A].map(BIO.unsafeNoCatch(_).flatMap(BIO.pure))
+    getArbitrary[A].map(BIO.unsafeDelay(_).flatMap(BIO.pure))
 
   def genFlatMap[E: Arbitrary, A: Arbitrary: Cogen]: Gen[BIO[E, A]] =
     for {

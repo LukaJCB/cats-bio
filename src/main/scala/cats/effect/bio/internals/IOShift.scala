@@ -1,8 +1,5 @@
 package cats.effect.bio.internals
 
-import cats.effect.bio.BIO
-import cats.effect.bio.BIO.ContextSwitch
-
 /*
  * Copyright (c) 2017-2019 The Typelevel Cats-effect Project Developers
  *
@@ -19,14 +16,25 @@ import cats.effect.bio.BIO.ContextSwitch
  * limitations under the License.
  */
 
-private[effect] object IOCancel {
-  /** Implementation for `IO.uncancelable`. */
-  def uncancelable[E, A](fa: BIO[E, A]): BIO[E, A] =
-    ContextSwitch(fa, makeUncancelable[E], disableUncancelable)
 
-  /** Internal reusable reference. */
-  private[this] def makeUncancelable[E]: IOConnection[E] => IOConnection[E] =
-    _ => IOConnection.uncancelable
-  private[this] def disableUncancelable[E]: (Any, E, IOConnection[E], IOConnection[E]) => IOConnection[E] =
-    (_, _, old, _) => old
+
+import cats.effect.bio.BIO
+
+import scala.concurrent.ExecutionContext
+
+private[effect] object IOShift {
+  /** Implementation for `IO.shift`. */
+  def apply[E](ec: ExecutionContext): BIO[E, Unit] =
+    BIO.Async(new IOForkedStart[E, Unit] {
+      def apply(conn: IOConnection[E], cb: Callback.T[E, Unit]): Unit =
+        ec.execute(new Tick(cb))
+    })
+
+  def shiftOn[E, A](cs: ExecutionContext, targetEc: ExecutionContext, io: BIO[E, A]): BIO[E, A] =
+    IOBracket[E, Unit, A](IOShift(cs))(_ => io)((_, _) => IOShift(targetEc))
+
+  private[internals] final class Tick[E](cb: Either[E, Unit] => Unit)
+    extends Runnable {
+    def run() = cb(Callback.rightUnit)
+  }
 }

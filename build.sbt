@@ -15,8 +15,8 @@ val common = Seq(
   libraryDependencies ++= Seq(
     "org.typelevel" %% "cats-core" % "1.5.0",
     "org.typelevel" %% "cats-testkit" % "1.5.0" % Test,
-    "org.typelevel" %% "cats-effect" % "1.0.0-RC",
-    "org.typelevel" %% "cats-effect-laws" % "1.0.0-RC"
+    "org.typelevel" %% "cats-effect" % "1.1.0",
+    "org.typelevel" %% "cats-effect-laws" % "1.1.0"
   )
 )
 

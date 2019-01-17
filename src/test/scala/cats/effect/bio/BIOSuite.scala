@@ -3,9 +3,9 @@ package cats.effect.bio
 import java.io.{ByteArrayOutputStream, PrintStream}
 
 import cats.effect.bio.BIO._
-import cats.effect.internals.NonFatal
 import cats.tests.CatsSuite
 import ArbitraryInstances._
+import cats.effect.ContextShift
 import cats.effect.laws.discipline.ConcurrentEffectTests
 import cats.effect.laws.util.TestContext
 import cats.laws.discipline.{BifunctorTests, SemigroupKTests, SemigroupalTests}
@@ -13,7 +13,13 @@ import org.typelevel.discipline.Laws
 import cats.effect.laws.util.TestInstances._
 import cats.kernel.laws.discipline.MonoidTests
 
+import scala.concurrent.ExecutionContext
+import scala.util.control.NonFatal
+import cats.effect.laws.discipline.arbitrary._
+
 class BIOSuite extends CatsSuite with TestInstances {
+
+  implicit val cs: ContextShift[BIO[Throwable, ?]] = BIO.contextShift[Throwable](ExecutionContext.global)
 
   def silenceSystemErr[A](thunk: => A): A = synchronized {
     // Silencing System.err
@@ -53,6 +59,4 @@ class BIOSuite extends CatsSuite with TestInstances {
   checkAllAsync("BIO", implicit ec => SemigroupKTests[BIO[String, ?]].semigroupK[Int])
   checkAllAsync("BIO", implicit ec => BifunctorTests[BIO].bifunctor[Int, String, Int, String, Int, String])
   checkAllAsync("BIO[Throwable, ?]", implicit ec => ConcurrentEffectTests[BIO[Throwable, ?]].concurrentEffect[Int, Int, Int])
-
-
 }

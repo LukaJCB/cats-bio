@@ -1,5 +1,7 @@
+package cats.effect.bio.internals
+
 /*
- * Copyright (c) 2017-2018 The Typelevel Cats-effect Project Developers
+ * Copyright (c) 2017-2019 The Typelevel Cats-effect Project Developers
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,39 +16,32 @@
  * limitations under the License.
  */
 
-package cats.effect.bio.internals
-
-import cats.effect.internals.TrampolineEC.immediate
-import cats.effect.Fiber
+import cats.effect.{ContextShift, Fiber}
 import cats.effect.bio.BIO
+import cats.implicits._
 
-import scala.concurrent.{ExecutionContext, Promise}
+import scala.concurrent.Promise
+import cats.effect.internals.TrampolineEC.immediate
 
 private[effect] object IOStart {
   /**
-   * Implementation for `IO.start`.
-   */
-  def apply[E, A](fa: BIO[E, A]): BIO[E, Fiber[BIO[E, ?], A]] =
-    BIO.Async { (_, cb) =>
-      implicit val ec: ExecutionContext = immediate
-      // Light async boundary
-      ec.execute(new Runnable {
-        def run(): Unit = {
-          // Memoization
-          val p = Promise[Either[E, A]]()
+    * Implementation for `IO.start`.
+    */
+  def apply[E, A](cs: ContextShift[BIO[E, ?]], fa: BIO[E, A]): BIO[E, Fiber[BIO[E, ?], A]] = {
+    val start: Start[E, Fiber[BIO[E, ?], A]] = (_, cb) => {
+      // Memoization
+      val p = Promise[Either[E, A]]()
 
-          // Starting the source `IO`, with a new connection, because its
-          // cancellation is now decoupled from our current one
-          val conn2 = IOConnection()
-          IORunLoop.startCancelable(fa, conn2, p.success)
+      // Starting the source `IO`, with a new connection, because its
+      // cancellation is now decoupled from our current one
+      val conn2 = IOConnection[E]()
+      IORunLoop.startCancelable(IOForkedStart(fa, cs), conn2, p.success)
 
-          // Building a memoized IO - note we cannot use `IO.fromFuture`
-          // because we need to link this `IO`'s cancellation with that
-          // of the executing task
-          val fiber = IOFiber.build(p, conn2)
-          // Signal the newly created fiber
-          cb(Right(fiber))
-        }
-      })
+      cb(Right(fiber(p, conn2)))
     }
+    BIO.Async(start, trampolineAfter = true)
+  }
+
+  private[internals] def fiber[E, A](p: Promise[Either[E, A]], conn: IOConnection[E]): Fiber[BIO[E, ?], A] =
+    Fiber[BIO[E, ?], A](BIO.async(fn => p.future.onSuccess { case thing => fn(thing) }(immediate)), conn.cancel)
 }

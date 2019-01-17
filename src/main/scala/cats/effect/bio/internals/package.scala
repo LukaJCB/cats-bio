@@ -1,5 +1,7 @@
+package cats.effect.bio
+
 /*
- * Copyright (c) 2017-2018 The Typelevel Cats-effect Project Developers
+ * Copyright (c) 2017-2019 The Typelevel Cats-effect Project Developers
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,24 +16,11 @@
  * limitations under the License.
  */
 
-package cats.effect.bio.internals
 
-import scala.util.{Failure, Success, Try}
-
-/**
- * Internal API — describes internal conversions.
- */
-private[effect] object Conversions {
-
-  def toTry[A](a: Either[Throwable, A]): Try[A] =
-    a match {
-      case Right(r) => Success(r)
-      case Left(l) => Failure(l)
-    }
-
-  def toEither[A](a: Try[A]): Either[Throwable, A] =
-    a match {
-      case Success(r) => Right(r)
-      case Failure(l) => Left(l)
-    }
+package object internals {
+  /**
+    * Handy alias for the registration functions of [[BIO.Async]].
+    */
+  private[effect] type Start[E, +A] =
+    (IOConnection[E], Callback.T[E, A]) => Unit
 }

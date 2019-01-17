@@ -1,5 +1,6 @@
+package cats.effect.bio
 /*
- * Copyright (c) 2017-2018 The Typelevel Cats-effect Project Developers
+ * Copyright (c) 2017-2019 The Typelevel Cats-effect Project Developers
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,88 +15,87 @@
  * limitations under the License.
  */
 
-package cats
-package effect
-package bio
-
+import cats.{Applicative, ApplicativeError, Bifunctor, Eval, Monad, Monoid, Now, Parallel, Semigroup, SemigroupK, StackSafeMonad, ~>}
 import cats.arrow.FunctionK
-import cats.effect.internals.TrampolineEC.immediate
 import cats.effect.bio.internals._
-import cats.effect.bio.internals.Callback.Extensions
-import cats.effect.bio.internals.IOPlatform.fusionMaxStackDepth
+import cats.effect._
+import cats.effect.bio.internals.IORunLoop.CustomException
 
 import scala.annotation.unchecked.uncheckedVariance
-import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration._
-import scala.util.{Failure, Left, Right, Success}
+import scala.concurrent.{ExecutionContext, Future, Promise, TimeoutException}
+import scala.util.control.NonFatal
+import scala.util.{Left, Right}
+import cats.effect.internals.IOPlatform.fusionMaxStackDepth
+import cats.effect.internals.Logger
 
 /**
- * A pure abstraction representing the intention to perform a
- * side effect, where the result of that side effect may be obtained
- * synchronously (via return) or asynchronously (via callback).
- *
- * `IO` values are pure, immutable values and thus preserve
- * referential transparency, being usable in functional programming.
- * An `IO` is a data structure that represents just a description
- * of a side effectful computation.
- *
- * `IO` can describe synchronous or asynchronous computations that:
- *
- *  1. on evaluation yield exactly one result
- *  1. can end in either success or failure and in case of failure
- *     `flatMap` chains get short-circuited (`IO` implementing
- *     the algebra of `MonadError`)
- *  1. can be canceled, but note this capability relies on the
- *     user to provide cancelation logic
- *
- * Effects described via this abstraction are not evaluated until
- * the "end of the world", which is to say, when one of the "unsafe"
- * methods are used. Effectful results are not memoized, meaning that
- * memory overhead is minimal (and no leaks), and also that a single
- * effect may be run multiple times in a referentially-transparent
- * manner. For example:
- *
- * {{{
- * val ioa = IO { println("hey!") }
- *
- * val program = for {
- *   _ <- ioa
- *   _ <- ioa
- * } yield ()
- *
- * program.unsafeRunSync()
- * }}}
- *
- * The above will print "hey!" twice, as the effect will be re-run
- * each time it is sequenced in the monadic chain.
- *
- * `IO` is trampolined in its `flatMap` evaluation. This means that
- * you can safely call `flatMap` in a recursive function of arbitrary
- * depth, without fear of blowing the stack.
- *
- * {{{
- *   def fib(n: Int, a: Long = 0, b: Long = 1): IO[Long] =
- *     IO(a + b).flatMap { b2 =>
- *       if (n > 0)
- *         fib(n - 1, b, b2)
- *       else
- *         IO.pure(b2)
- *     }
- * }}}
- */
+  * A pure abstraction representing the intention to perform a
+  * side effect, where the result of that side effect may be obtained
+  * synchronously (via return) or asynchronously (via callback).
+  *
+  * `IO` values are pure, immutable values and thus preserve
+  * referential transparency, being usable in functional programming.
+  * An `IO` is a data structure that represents just a description
+  * of a side effectful computation.
+  *
+  * `IO` can describe synchronous or asynchronous computations that:
+  *
+  *  1. on evaluation yield exactly one result
+  *  1. can end in either success or failure and in case of failure
+  *     `flatMap` chains get short-circuited (`IO` implementing
+  *     the algebra of `MonadError`)
+  *  1. can be canceled, but note this capability relies on the
+  *     user to provide cancellation logic
+  *
+  * Effects described via this abstraction are not evaluated until
+  * the "end of the world", which is to say, when one of the "unsafe"
+  * methods are used. Effectful results are not memoized, meaning that
+  * memory overhead is minimal (and no leaks), and also that a single
+  * effect may be run multiple times in a referentially-transparent
+  * manner. For example:
+  *
+  * {{{
+  * val ioa = IO { println("hey!") }
+  *
+  * val program = for {
+  *   _ <- ioa
+  *   _ <- ioa
+  * } yield ()
+  *
+  * program.unsafeRunSync()
+  * }}}
+  *
+  * The above will print "hey!" twice, as the effect will be re-run
+  * each time it is sequenced in the monadic chain.
+  *
+  * `IO` is trampolined in its `flatMap` evaluation. This means that
+  * you can safely call `flatMap` in a recursive function of arbitrary
+  * depth, without fear of blowing the stack.
+  *
+  * {{{
+  *   def fib(n: Int, a: Long = 0, b: Long = 1): IO[Long] =
+  *     IO(a + b).flatMap { b2 =>
+  *       if (n > 0)
+  *         fib(n - 1, b, b2)
+  *       else
+  *         IO.pure(b2)
+  *     }
+  * }}}
+  */
 sealed abstract class BIO[+E, +A] {
   import BIO._
 
   /**
-   * Functor map on `IO`. Given a mapping functions, it transforms the
-   * value produced by the source, while keeping the `IO` context.
-   *
-   * Any exceptions thrown within the function will be caught and
-   * sequenced into the `IO`, because due to the nature of
-   * asynchronous processes, without catching and handling exceptions,
-   * failures would be completely silent and `IO` references would
-   * never terminate on evaluation.
-   */
+    * Functor map on `IO`. Given a mapping function, it transforms the
+    * value produced by the source, while keeping the `IO` context.
+    *
+    * Any exceptions thrown within the function will be caught and
+    * sequenced into the `IO`, because due to the nature of
+    * asynchronous processes, without catching and handling exceptions,
+    * failures would be completely silent and `IO` references would
+    * never terminate on evaluation.
+    */
   final def map[B](f: A => B): BIO[E, B] =
     this match {
       case Map(source, g, index) =>
@@ -121,208 +121,223 @@ sealed abstract class BIO[+E, +A] {
     }
 
   /**
-   * Monadic bind on `IO`, used for sequentially composing two `IO`
-   * actions, where the value produced by the first `IO` is passed as
-   * input to a function producing the second `IO` action.
-   *
-   * Due to this operation's signature, `flatMap` forces a data
-   * dependency between two `IO` actions, thus ensuring sequencing
-   * (e.g. one action to be executed before another one).
-   *
-   * Any exceptions thrown within the function will be caught and
-   * sequenced into the `IO`, because due to the nature of
-   * asynchronous processes, without catching and handling exceptions,
-   * failures would be completely silent and `IO` references would
-   * never terminate on evaluation.
-   */
+    * Monadic bind on `IO`, used for sequentially composing two `IO`
+    * actions, where the value produced by the first `IO` is passed as
+    * input to a function producing the second `IO` action.
+    *
+    * Due to this operation's signature, `flatMap` forces a data
+    * dependency between two `IO` actions, thus ensuring sequencing
+    * (e.g. one action to be executed before another one).
+    *
+    * Any exceptions thrown within the function will be caught and
+    * sequenced into the `IO`, because due to the nature of
+    * asynchronous processes, without catching and handling exceptions,
+    * failures would be completely silent and `IO` references would
+    * never terminate on evaluation.
+    */
   final def flatMap[E1 >: E, B](f: A => BIO[E1, B]): BIO[E1, B] =
     Bind(this, f)
 
   /**
-   * Materializes any sequenced exceptions into value space, where
-   * they may be handled.
-   *
-   * This is analogous to the `catch` clause in `try`/`catch`, being
-   * the inverse of `IO.raiseError`. Thus:
-   *
-   * {{{
-   * IO.raiseError(ex).attempt.unsafeRunAsync === Left(ex)
-   * }}}
-   *
-   * @see [[BIO.raiseError]]
-   */
+    * Materializes any sequenced exceptions into value space, where
+    * they may be handled.
+    *
+    * This is analogous to the `catch` clause in `try`/`catch`, being
+    * the inverse of `IO.raiseError`. Thus:
+    *
+    * {{{
+    * IO.raiseError(ex).attempt.unsafeRunAsync === Left(ex)
+    * }}}
+    *
+    * @see [[BIO.raiseError]]
+    */
   def attempt[X]: BIO[X, Either[E, A]] =
     Bind(this, AttemptIO.asInstanceOf[A => BIO[E, Either[E, A]]]).asInstanceOf[BIO[X, Either[E, A]]]
 
   /**
-   * Produces an `IO` reference that should execute the source on
-   * evaluation, without waiting for its result, being the safe
-   * analogue to [[unsafeRunAsync]].
-   *
-   * This operation is isomorphic to [[unsafeRunAsync]]. What it does
-   * is to let you describe asynchronous execution with a function
-   * that stores off the results of the original `IO` as a
-   * side effect, thus ''avoiding'' the usage of impure callbacks or
-   * eager evaluation.
-   *
-   * The returned `IO` is guaranteed to execute immediately,
-   * and does not wait on any async action to complete, thus this
-   * is safe to do, even on top of runtimes that cannot block threads
-   * (e.g. JavaScript):
-   *
-   * {{{
-   *   // Sample
-   *   val source = IO.shift *> IO(1)
-   *   // Describes execution
-   *   val start = source.runAsync {
-   *     case Left(e) => IO(e.printStackTrace())
-   *     case Right(_) => IO.unit
-   *   }
-   *   // Safe, because it does not block for the source to finish
-   *   start.unsafeRunSync
-   * }}}
-   *
-   * @return an `IO` value that upon evaluation will execute the source,
-   *         but will not wait for its completion
-   *
-   * @see [[runCancelable]] for the version that gives you a cancelable
-   *      token that can be used to send a cancel signal
-   */
-  final def runAsync(cb: Either[E, A] => BIO[Throwable, Unit]): BIO[Throwable, Unit] = BIO {
-    unsafeRunAsync(cb.andThen(_.unsafeRunAsync(Callback.report)))
-  }
-
-
-  /**
-   * Produces an `IO` reference that should execute the source on evaluation,
-   * without waiting for its result and return a cancelable token, being the
-   * safe analogue to [[unsafeRunCancelable]].
-   *
-   * This operation is isomorphic to [[unsafeRunCancelable]]. Just like
-   * [[runAsync]], this operation avoids the usage of impure callbacks or
-   * eager evaluation.
-   *
-   * The returned `IO` boxes an `IO[Unit]` that can be used to cancel the
-   * running asynchronous computation (if the source can be cancelled).
-   *
-   * The returned `IO` is guaranteed to execute immediately,
-   * and does not wait on any async action to complete, thus this
-   * is safe to do, even on top of runtimes that cannot block threads
-   * (e.g. JavaScript):
-   *
-   * {{{
-   *   val source: IO[Int] = ???
-   *   // Describes interruptible execution
-   *   val start: IO[IO[Unit]] = source.runCancelable
-   *
-   *   // Safe, because it does not block for the source to finish
-   *   val cancel: IO[Unit] = start.unsafeRunSync
-   *
-   *   // Safe, because cancelation only sends a signal,
-   *   // but doesn't back-pressure on anything
-   *   cancel.unsafeRunSync
-   * }}}
-   *
-   * @return an `IO` value that upon evaluation will execute the source,
-   *         but will not wait for its completion, yielding a cancelation
-   *         token that can be used to cancel the async process
-   *
-   * @see [[runAsync]] for the simple, uninterruptible version
-   */
-  final def runCancelable(cb: Either[E, A] => BIO[Throwable, Unit]): BIO[Throwable, BIO[Throwable, Unit]] = BIO {
-    val cancel = unsafeRunCancelable(cb.andThen(_.unsafeRunAsync(_ => ())))
-    BIO.Delay(cancel, identity)
+    * Produces an `IO` reference that should execute the source on
+    * evaluation, without waiting for its result, being the safe
+    * analogue to [[unsafeRunAsync]].
+    *
+    * This operation is isomorphic to [[unsafeRunAsync]]. What it does
+    * is to let you describe asynchronous execution with a function
+    * that stores off the results of the original `IO` as a
+    * side effect, thus ''avoiding'' the usage of impure callbacks or
+    * eager evaluation.
+    *
+    * The returned `IO` is guaranteed to execute immediately,
+    * and does not wait on any async action to complete, thus this
+    * is safe to do, even on top of runtimes that cannot block threads
+    * (e.g. JavaScript):
+    *
+    * {{{
+    *   // Sample
+    *   val source = IO.shift *> IO(1)
+    *   // Describes execution
+    *   val start = source.runAsync {
+    *     case Left(e) => IO(e.printStackTrace())
+    *     case Right(_) => IO.unit
+    *   }
+    *   // Safe, because it does not block for the source to finish
+    *   start.unsafeRunSync
+    * }}}
+    *
+    * @return an `IO` value that upon evaluation will execute the source,
+    *         but will not wait for its completion
+    *
+    * @see [[runCancelable]] for the version that gives you a cancelable
+    *      token that can be used to send a cancel signal
+    */
+  final def runAsync(cb: Either[E, A] => BIO[Throwable, Unit]): SyncIO[Unit] = SyncIO {
+    unsafeRunAsync(cb.andThen(_.unsafeRunAsyncAndForget()))
   }
 
   /**
-   * Produces the result by running the encapsulated effects as impure
-   * side effects.
-   *
-   * If any component of the computation is asynchronous, the current
-   * thread will block awaiting the results of the async computation.
-   * On JavaScript, an exception will be thrown instead to avoid
-   * generating a deadlock. By default, this blocking will be
-   * unbounded.  To limit the thread block to some fixed time, use
-   * `unsafeRunTimed` instead.
-   *
-   * Any exceptions raised within the effect will be re-thrown during
-   * evaluation.
-   *
-   * As the name says, this is an UNSAFE function as it is impure and
-   * performs side effects, not to mention blocking, throwing
-   * exceptions, and doing other things that are at odds with
-   * reasonable software.  You should ideally only call this function
-   * *once*, at the very end of your program.
-   */
+    * Produces an `IO` reference that should execute the source on evaluation,
+    * without waiting for its result and return a cancelable token, being the
+    * safe analogue to [[unsafeRunCancelable]].
+    *
+    * This operation is isomorphic to [[unsafeRunCancelable]]. Just like
+    * [[runAsync]], this operation avoids the usage of impure callbacks or
+    * eager evaluation.
+    *
+    * The returned `IO` boxes an `IO[Unit]` that can be used to cancel the
+    * running asynchronous computation (if the source can be canceled).
+    *
+    * The returned `IO` is guaranteed to execute immediately,
+    * and does not wait on any async action to complete, thus this
+    * is safe to do, even on top of runtimes that cannot block threads
+    * (e.g. JavaScript):
+    *
+    * {{{
+    *   val source: IO[Int] = ???
+    *   // Describes interruptible execution
+    *   val start: IO[CancelToken[IO]] = source.runCancelable
+    *
+    *   // Safe, because it does not block for the source to finish
+    *   val cancel: IO[Unit] = start.unsafeRunSync
+    *
+    *   // Safe, because cancellation only sends a signal,
+    *   // but doesn't back-pressure on anything
+    *   cancel.unsafeRunSync
+    * }}}
+    *
+    * @return an `IO` value that upon evaluation will execute the source,
+    *         but will not wait for its completion, yielding a cancellation
+    *         token that can be used to cancel the async process
+    *
+    * @see [[runAsync]] for the simple, uninterruptible version
+    */
+  final def runCancelable[E1 >: E](cb: Either[E1, A] => BIO[Throwable, Unit]): SyncIO[CancelToken[BIO[E1, ?]]] =
+    SyncIO {
+      unsafeRunCancelable(cb.andThen(_.unsafeRunAsync(_ => ())))
+    }
+
+  /**
+    * Produces the result by running the encapsulated effects as impure
+    * side effects.
+    *
+    * If any component of the computation is asynchronous, the current
+    * thread will block awaiting the results of the async computation.
+    * On JavaScript, an exception will be thrown instead to avoid
+    * generating a deadlock. By default, this blocking will be
+    * unbounded.  To limit the thread block to some fixed time, use
+    * `unsafeRunTimed` instead.
+    *
+    * Any exceptions raised within the effect will be re-thrown during
+    * evaluation.
+    *
+    * As the name says, this is an UNSAFE function as it is impure and
+    * performs side effects, not to mention blocking, throwing
+    * exceptions, and doing other things that are at odds with
+    * reasonable software.  You should ideally only call this function
+    * *once*, at the very end of your program.
+    */
   final def unsafeRunSync(): A = unsafeRunTimed(Duration.Inf).get
 
   /**
-   * Passes the result of the encapsulated effects to the given
-   * callback by running them as impure side effects.
-   *
-   * Any exceptions raised within the effect will be passed to the
-   * callback in the `Either`.  The callback will be invoked at most
-   * *once*.  Note that it is very possible to construct an IO which
-   * never returns while still never blocking a thread, and attempting
-   * to evaluate that IO with this method will result in a situation
-   * where the callback is *never* invoked.
-   *
-   * As the name says, this is an UNSAFE function as it is impure and
-   * performs side effects.  You should ideally only call this
-   * function ''once'', at the very end of your program.
-   */
+    * Passes the result of the encapsulated effects to the given
+    * callback by running them as impure side effects.
+    *
+    * Any exceptions raised within the effect will be passed to the
+    * callback in the `Either`.  The callback will be invoked at most
+    * *once*.  Note that it is very possible to construct an IO which
+    * never returns while still never blocking a thread, and attempting
+    * to evaluate that IO with this method will result in a situation
+    * where the callback is *never* invoked.
+    *
+    * As the name says, this is an UNSAFE function as it is impure and
+    * performs side effects.  You should ideally only call this
+    * function ''once'', at the very end of your program.
+    */
   final def unsafeRunAsync(cb: Either[E, A] => Unit): Unit =
     IORunLoop.start(this, cb)
 
   /**
-   * Evaluates the source `IO`, passing the result of the encapsulated
-   * effects to the given callback.
-   *
-   * As the name says, this is an UNSAFE function as it is impure and
-   * performs side effects.  You should ideally only call this
-   * function ''once'', at the very end of your program.
-   *
-   * @return an side-effectful function that, when executed, sends a
-   *         cancelation reference to `IO`'s run-loop implementation,
-   *         having the potential to interrupt it.
-   */
-  final def unsafeRunCancelable(cb: Either[E, A] => Unit): () => Unit = {
-    val conn = IOConnection()
+    * Triggers the evaluation of the source and any suspended side
+    * effects therein, but ignores the result.
+    *
+    * This operation is similar to [[unsafeRunAsync]], in that the
+    * evaluation can happen asynchronously (depending on the source),
+    * however no callback is required, therefore the result gets
+    * ignored.
+    *
+    * Note that errors still get logged (via IO's internal logger),
+    * because errors being thrown should never be totally silent.
+    */
+  final def unsafeRunAsyncAndForget(): Unit =
+    unsafeRunAsync(Callback.report)
+
+  /**
+    * Evaluates the source `IO`, passing the result of the encapsulated
+    * effects to the given callback.
+    *
+    * As the name says, this is an UNSAFE function as it is impure and
+    * performs side effects.  You should ideally only call this
+    * function ''once'', at the very end of your program.
+    *
+    * @return an side-effectful function that, when executed, sends a
+    *         cancellation reference to `IO`'s run-loop implementation,
+    *         having the potential to interrupt it.
+    */
+  final def unsafeRunCancelable[E1 >: E](cb: Either[E1, A] => Unit): CancelToken[BIO[E1, ?]] = {
+    val conn = IOConnection[E1]()
     IORunLoop.startCancelable(this, conn, cb)
     conn.cancel
   }
 
   /**
-   * Similar to `unsafeRunSync`, except with a bounded blocking
-   * duration when awaiting asynchronous results.
-   *
-   * Please note that the `limit` parameter does not limit the time of
-   * the total computation, but rather acts as an upper bound on any
-   * *individual* asynchronous block.  Thus, if you pass a limit of `5
-   * seconds` to an `IO` consisting solely of synchronous actions, the
-   * evaluation may take considerably longer than 5 seconds!
-   * Furthermore, if you pass a limit of `5 seconds` to an `IO`
-   * consisting of several asynchronous actions joined together,
-   * evaluation may take up to `n * 5 seconds`, where `n` is the
-   * number of joined async actions.
-   *
-   * As soon as an async blocking limit is hit, evaluation
-   * ''immediately'' aborts and `None` is returned.
-   *
-   * Please note that this function is intended for ''testing''; it
-   * should never appear in your mainline production code!  It is
-   * absolutely not an appropriate function to use if you want to
-   * implement timeouts, or anything similar. If you need that sort
-   * of functionality, you should be using a streaming library (like
-   * fs2 or Monix).
-   *
-   * @see [[unsafeRunSync]]
-   */
+    * Similar to `unsafeRunSync`, except with a bounded blocking
+    * duration when awaiting asynchronous results.
+    *
+    * Please note that the `limit` parameter does not limit the time of
+    * the total computation, but rather acts as an upper bound on any
+    * *individual* asynchronous block.  Thus, if you pass a limit of `5
+    * seconds` to an `IO` consisting solely of synchronous actions, the
+    * evaluation may take considerably longer than 5 seconds!
+    * Furthermore, if you pass a limit of `5 seconds` to an `IO`
+    * consisting of several asynchronous actions joined together,
+    * evaluation may take up to `n * 5 seconds`, where `n` is the
+    * number of joined async actions.
+    *
+    * As soon as an async blocking limit is hit, evaluation
+    * ''immediately'' aborts and `None` is returned.
+    *
+    * Please note that this function is intended for ''testing''; it
+    * should never appear in your mainline production code!  It is
+    * absolutely not an appropriate function to use if you want to
+    * implement timeouts, or anything similar. If you need that sort
+    * of functionality, you should be using a streaming library (like
+    * fs2 or Monix).
+    *
+    * @see [[unsafeRunSync]]
+    * @see [[timeout]] for pure and safe version
+    */
   final def unsafeRunTimed(limit: Duration): Option[A] =
     IORunLoop.step(this) match {
       case Pure(a) => Some(a)
-      case RaiseError(e) => throw new IORunLoop.CustomException(e)
-      case self @ Async(_) =>
+      case RaiseError(e) => throw CustomException(e)
+      case self @ Async(_, _) =>
         IOPlatform.unsafeResync(self, limit)
       case _ =>
         // $COVERAGE-OFF$
@@ -331,79 +346,364 @@ sealed abstract class BIO[+E, +A] {
     }
 
   /**
-   * Evaluates the effect and produces the result in a `Future`.
-   *
-   * This is similar to `unsafeRunAsync` in that it evaluates the `IO`
-   * as a side effect in a non-blocking fashion, but uses a `Future`
-   * rather than an explicit callback.  This function should really
-   * only be used if interoperating with legacy code which uses Scala
-   * futures.
-   *
-   * @see [[BIO.fromFuture]]
-   */
+    * Evaluates the effect and produces the result in a `Future`.
+    *
+    * This is similar to `unsafeRunAsync` in that it evaluates the `IO`
+    * as a side effect in a non-blocking fashion, but uses a `Future`
+    * rather than an explicit callback.  This function should really
+    * only be used if interoperating with legacy code which uses Scala
+    * futures.
+    *
+    * @see [[BIO.fromFuture]]
+    */
   final def unsafeToFuture(): Future[A] = {
     val p = Promise[A]
-    unsafeRunAsync(_.fold(e => p.failure(new IORunLoop.CustomException(e)), p.success))
+    unsafeRunAsync(_.fold(e => p.failure(CustomException(e)), p.success))
     p.future
   }
 
   /**
-   * Start execution of the source suspended in the `IO` context.
-   *
-   * This can be used for non-deterministic / concurrent execution.
-   * The following code is more or less equivalent with `parMap2`
-   * (minus the behavior on error handling and cancelation):
-   *
-   * {{{
-   *   def par2[A, B](ioa: IO[A], iob: IO[B]): IO[(A, B)] =
-   *     for {
-   *       fa <- ioa.start
-   *       fb <- iob.start
-   *        a <- fa.join
-   *        b <- fb.join
-   *     } yield (a, b)
-   * }}}
-   *
-   * Note in such a case usage of `parMapN` (via `cats.Parallel`) is
-   * still recommended because of behavior on error and cancelation —
-   * consider in the example above what would happen if the first task
-   * finishes in error. In that case the second task doesn't get cancelled,
-   * which creates a potential memory leak.
-   *
-   * IMPORTANT — this operation does not start with an asynchronous boundary.
-   * But you can use [[BIO.shift(implicit* IO.shift]] to force an async
-   * boundary just before start.
-   */
-  final def start[E1 >: E]: BIO[E1, Fiber[BIO[E1, ?], A @uncheckedVariance]] =
-    IOStart(this)
-
+    * Start execution of the source suspended in the `IO` context.
+    *
+    * This can be used for non-deterministic / concurrent execution.
+    * The following code is more or less equivalent with `parMap2`
+    * (minus the behavior on error handling and cancellation):
+    *
+    * {{{
+    *   def par2[A, B](ioa: IO[A], iob: IO[B]): IO[(A, B)] =
+    *     for {
+    *       fa <- ioa.start
+    *       fb <- iob.start
+    *        a <- fa.join
+    *        b <- fb.join
+    *     } yield (a, b)
+    * }}}
+    *
+    * Note in such a case usage of `parMapN` (via `cats.Parallel`) is
+    * still recommended because of behavior on error and cancellation —
+    * consider in the example above what would happen if the first task
+    * finishes in error. In that case the second task doesn't get canceled,
+    * which creates a potential memory leak.
+    */
+  final def start[E1 >: E](implicit cs: ContextShift[BIO[E1, ?]]): BIO[E1, Fiber[BIO[E1, ?], A @uncheckedVariance]] =
+    IOStart(cs, this)
 
   /**
-   * Returns a new `IO` that mirrors the source task for normal termination,
-   * but that triggers the given error on cancelation.
-   *
-   * Normally tasks that are cancelled become non-terminating.
-   *
-   * This `onCancelRaiseError` operator transforms a task that is
-   * non-terminating on cancelation into one that yields an error,
-   * thus equivalent with [[BIO.raiseError]].
-   */
-  final def onCancelRaiseError[E1 >: E](e: E1): BIO[E1, A] =
-    IOCancel.raise(this, e)
-
-  /**
-   * Makes the source `IO` uninterruptible such that a [[Fiber.cancel]]
-   * signal has no effect.
-   */
+    * Makes the source `IO` uninterruptible such that a [[Fiber.cancel]]
+    * signal has no effect.
+    */
   final def uncancelable: BIO[E, A] =
     IOCancel.uncancelable(this)
 
-  def catchAll[E1, B >: A](f: E => BIO[E1, B]): BIO[E1, B] = redeem(f)(BIO.pure[E1, B])
+  /**
+    * Returns an IO that either completes with the result of the source within
+    * the specified time `duration` or otherwise evaluates the `fallback`.
+    *
+    * The source is cancelled in the event that it takes longer than
+    * the `FiniteDuration` to complete, the evaluation of the fallback
+    * happening immediately after that.
+    *
+    * @param duration is the time span for which we wait for the source to
+    *                 complete; in the event that the specified time has passed without
+    *                 the source completing, the `fallback` gets evaluated
+    * @param fallback is the task evaluated after the duration has passed and
+    *                 the source canceled
+    * @param timer    is an implicit requirement for the ability to do a fiber
+    *                 [[Timer.sleep sleep]] for the specified timeout, at which point
+    *                 the fallback needs to be triggered
+    * @param cs       is an implicit requirement for the ability to trigger a
+    *                 [[BIO.race race]], needed because IO's `race` operation automatically
+    *                 forks the involved tasks
+    */
+  final def timeoutTo[E1 >: E, A2 >: A](duration: FiniteDuration, fallback: BIO[E1, A2])
+                              (implicit timer: Timer[BIO[E1, ?]], cs: ContextShift[BIO[E1, ?]], F: Concurrent[BIO[E1, ?]]): BIO[E1, A2] =
+    Concurrent.timeoutTo[BIO[E1, ?], A2](this, duration, fallback)
 
-  def redeem[E1, B](f: E => BIO[E1, B])(g: A => BIO[E1, B]): BIO[E1, B] =
-    BIO.Bind(this, IOFrame.redeemer(f, g))
+  /**
+    * Returns an IO that either completes with the result of the source within
+    * the specified time `duration` or otherwise raises a `TimeoutException`.
+    *
+    * The source is cancelled in the event that it takes longer than
+    * the specified time duration to complete.
+    *
+    * @param duration is the time span for which we wait for the source to
+    *                 complete; in the event that the specified time has passed without
+    *                 the source completing, a `TimeoutException` is raised
+    * @param timer    is an implicit requirement for the ability to do a fiber
+    *                 [[Timer.sleep sleep]] for the specified timeout, at which point
+    *                 the fallback needs to be triggered
+    * @param cs       is an implicit requirement for the ability to trigger a
+    *                 [[BIO.race race]], needed because IO's `race` operation automatically
+    *                 forks the involved tasks
+    */
+  final def timeout[E1 >: E](duration: FiniteDuration)
+                   (onTimeout: => E1)
+                   (implicit timer: Timer[BIO[E1, ?]], cs: ContextShift[BIO[E1, ?]], F: Concurrent[BIO[E1, ?]]): BIO[E1, A] =
+    timeoutTo[E1, A](duration, BIO.raiseError(onTimeout))
 
-  override def toString = this match {
+  /**
+    * Returns an `IO` action that treats the source task as the
+    * acquisition of a resource, which is then exploited by the `use`
+    * function and then `released`.
+    *
+    * The `bracket` operation is the equivalent of the
+    * `try {} catch {} finally {}` statements from mainstream languages.
+    *
+    * The `bracket` operation installs the necessary exception handler
+    * to release the resource in the event of an exception being raised
+    * during the computation, or in case of cancellation.
+    *
+    * If an exception is raised, then `bracket` will re-raise the
+    * exception ''after'' performing the `release`. If the resulting
+    * task gets canceled, then `bracket` will still perform the
+    * `release`, but the yielded task will be non-terminating
+    * (equivalent with [[BIO.never]]).
+    *
+    * Example:
+    *
+    * {{{
+    *   import java.io._
+    *
+    *   def readFile(file: File): IO[String] = {
+    *     // Opening a file handle for reading text
+    *     val acquire = IO(new BufferedReader(
+    *       new InputStreamReader(new FileInputStream(file), "utf-8")
+    *     ))
+    *
+    *     acquire.bracket { in =>
+    *       // Usage part
+    *       IO {
+    *         // Yes, ugly Java, non-FP loop;
+    *         // side-effects are suspended though
+    *         var line: String = null
+    *         val buff = new StringBuilder()
+    *         do {
+    *           line = in.readLine()
+    *           if (line != null) buff.append(line)
+    *         } while (line != null)
+    *         buff.toString()
+    *       }
+    *     } { in =>
+    *       // The release part
+    *       IO(in.close())
+    *     }
+    *   }
+    * }}}
+    *
+    * Note that in case of cancellation the underlying implementation
+    * cannot guarantee that the computation described by `use` doesn't
+    * end up executed concurrently with the computation from
+    * `release`. In the example above that ugly Java loop might end up
+    * reading from a `BufferedReader` that is already closed due to the
+    * task being canceled, thus triggering an error in the background
+    * with nowhere to get signaled.
+    *
+    * In this particular example, given that we are just reading from a
+    * file, it doesn't matter. But in other cases it might matter, as
+    * concurrency on top of the JVM when dealing with I/O might lead to
+    * corrupted data.
+    *
+    * For those cases you might want to do synchronization (e.g. usage
+    * of locks and semaphores) and you might want to use [[bracketCase]],
+    * the version that allows you to differentiate between normal
+    * termination and cancellation.
+    *
+    * '''NOTE on error handling''': one big difference versus
+    * `try/finally` statements is that, in case both the `release`
+    * function and the `use` function throws, the error raised by `use`
+    * gets signaled.
+    *
+    * For example:
+    *
+    * {{{
+    *   IO("resource").bracket { _ =>
+    *     // use
+    *     IO.raiseError(new RuntimeException("Foo"))
+    *   } { _ =>
+    *     // release
+    *     IO.raiseError(new RuntimeException("Bar"))
+    *   }
+    * }}}
+    *
+    * In this case the error signaled downstream is `"Foo"`, while the
+    * `"Bar"` error gets reported. This is consistent with the behavior
+    * of Haskell's `bracket` operation and NOT with `try {} finally {}`
+    * from Scala, Java or JavaScript.
+    *
+    * @see [[bracketCase]]
+    * @param use is a function that evaluates the resource yielded by
+    *        the source, yielding a result that will get generated by
+    *        the task returned by this `bracket` function
+    * @param release is a function that gets called after `use`
+    *        terminates, either normally or in error, or if it gets
+    *        canceled, receiving as input the resource that needs to
+    *        be released
+    */
+  final def bracket[E1 >: E, B](use: A => BIO[E1, B])(release: A => BIO[E1, Unit]): BIO[E1, B] =
+    bracketCase(use)((a, _) => release(a))
+
+  /**
+    * Returns a new `IO` task that treats the source task as the
+    * acquisition of a resource, which is then exploited by the `use`
+    * function and then `released`, with the possibility of
+    * distinguishing between normal termination and cancellation, such
+    * that an appropriate release of resources can be executed.
+    *
+    * The `bracketCase` operation is the equivalent of
+    * `try {} catch {} finally {}` statements from mainstream languages
+    * when used for the acquisition and release of resources.
+    *
+    * The `bracketCase` operation installs the necessary exception handler
+    * to release the resource in the event of an exception being raised
+    * during the computation, or in case of cancellation.
+    *
+    * In comparison with the simpler [[bracket]] version, this one
+    * allows the caller to differentiate between normal termination,
+    * termination in error and cancellation via an [[ExitCase]]
+    * parameter.
+    *
+    * @see [[bracket]]
+    *
+    * @param use is a function that evaluates the resource yielded by
+    *        the source, yielding a result that will get generated by
+    *        this function on evaluation
+    *
+    * @param release is a function that gets called after `use`
+    *        terminates, either normally or in error, or if it gets
+    *        canceled, receiving as input the resource that needs that
+    *        needs release, along with the result of `use`
+    *        (cancellation, error or successful result)
+    */
+  def bracketCase[E1 >: E, B](use: A => BIO[E1, B])(release: (A, ExitCase[E1]) => BIO[E1, Unit]): BIO[E1, B] =
+    IOBracket[E1, A, B](this)(use)(release)
+
+  /**
+    * Executes the given `finalizer` when the source is finished,
+    * either in success or in error, or if canceled.
+    *
+    * This variant of [[guaranteeCase]] evaluates the given `finalizer`
+    * regardless of how the source gets terminated:
+    *
+    *  - normal completion
+    *  - completion in error
+    *  - cancelation
+    *
+    * This equivalence always holds:
+    *
+    * {{{
+    *   io.guarantee(f) <-> IO.unit.bracket(_ => io)(_ => f)
+    * }}}
+    *
+    * As best practice, it's not a good idea to release resources
+    * via `guaranteeCase` in polymorphic code. Prefer [[bracket]]
+    * for the acquisition and release of resources.
+    *
+    * @see [[guaranteeCase]] for the version that can discriminate
+    *      between termination conditions
+    *
+    * @see [[bracket]] for the more general operation
+    */
+  def guarantee[E1 >: E](finalizer: BIO[E1, Unit]): BIO[E1, A] =
+    guaranteeCase[E1](_ => finalizer)
+
+  /**
+    * Executes the given `finalizer` when the source is finished,
+    * either in success or in error, or if canceled, allowing
+    * for differentiating between exit conditions.
+    *
+    * This variant of [[guarantee]] injects an [[ExitCase]] in
+    * the provided function, allowing one to make a difference
+    * between:
+    *
+    *  - normal completion
+    *  - completion in error
+    *  - cancelation
+    *
+    * This equivalence always holds:
+    *
+    * {{{
+    *   io.guaranteeCase(f) <-> IO.unit.bracketCase(_ => io)((_, e) => f(e))
+    * }}}
+    *
+    * As best practice, it's not a good idea to release resources
+    * via `guaranteeCase` in polymorphic code. Prefer [[bracketCase]]
+    * for the acquisition and release of resources.
+    *
+    * @see [[guarantee]] for the simpler version
+    *
+    * @see [[bracketCase]] for the more general operation
+    */
+  def guaranteeCase[E1 >: E](finalizer: ExitCase[E1] => BIO[E1, Unit]): BIO[E1, A] =
+    IOBracket.guaranteeCase(this, finalizer)
+
+  /**
+    * Handle any error, potentially recovering from it, by mapping it to another
+    * `IO` value.
+    *
+    * Implements `ApplicativeError.handleErrorWith`.
+    */
+  def handleErrorWith[E1 >: E, AA >: A](f: E1 => BIO[E1, AA]): BIO[E1, AA] =
+    BIO.Bind(this, new IOFrame.ErrorHandler(f, BIO.pure[E1, AA]))
+
+  /**
+    * Returns a new value that transforms the result of the source,
+    * given the `recover` or `map` functions, which get executed depending
+    * on whether the result is successful or if it ends in error.
+    *
+    * This is an optimization on usage of [[attempt]] and [[map]],
+    * this equivalence being true:
+    *
+    * {{{
+    *   io.redeem(recover, map) <-> io.attempt.map(_.fold(recover, map))
+    * }}}
+    *
+    * Usage of `redeem` subsumes `handleError` because:
+    *
+    * {{{
+    *   io.redeem(fe, id) <-> io.handleError(fe)
+    * }}}
+    *
+    * @param recover is a function used for error recover in case the
+    *        source ends in error
+    * @param map is a function used for mapping the result of the source
+    *        in case it ends in success
+    */
+  def redeem[E1 >: E, B](recover: E1 => B, map: A => B): BIO[E1, B] =
+    BIO.Bind(this, new IOFrame.Redeem(recover, map))
+
+  /**
+    * Returns a new value that transforms the result of the source,
+    * given the `recover` or `bind` functions, which get executed depending
+    * on whether the result is successful or if it ends in error.
+    *
+    * This is an optimization on usage of [[attempt]] and [[flatMap]],
+    * this equivalence being available:
+    *
+    * {{{
+    *   io.redeemWith(recover, bind) <-> io.attempt.flatMap(_.fold(recover, bind))
+    * }}}
+    *
+    * Usage of `redeemWith` subsumes `handleErrorWith` because:
+    *
+    * {{{
+    *   io.redeemWith(fe, F.pure) <-> io.handleErrorWith(fe)
+    * }}}
+    *
+    * Usage of `redeemWith` also subsumes [[flatMap]] because:
+    *
+    * {{{
+    *   io.redeemWith(F.raiseError, fs) <-> io.flatMap(fs)
+    * }}}
+    *
+    * @param recover is the function that gets called to recover the source
+    *        in case of error
+    * @param bind is the function that gets to transform the source
+    *        in case of success
+    */
+  def redeemWith[E1 >: E, B](recover: E1 => BIO[E1, B], bind: A => BIO[E1, B]): BIO[E1, B] =
+    BIO.Bind(this, new IOFrame.RedeemWith(recover, bind))
+
+  override def toString: String = this match {
     case Pure(a) => s"IO($a)"
     case RaiseError(e) => s"IO(throw $e)"
     case _ => "IO$" + System.identityHashCode(this)
@@ -413,22 +713,24 @@ sealed abstract class BIO[+E, +A] {
 private[effect] abstract class IOParallelNewtype
   extends internals.IOTimerRef {
 
-  /** Newtype encoding for an `IO` datatype that has a `cats.Applicative`
-   * capable of doing parallel processing in `ap` and `map2`, needed
-   * for implementing `cats.Parallel`.
-   *
-   * Helpers are provided for converting back and forth in `Par.apply`
-   * for wrapping any `IO` value and `Par.unwrap` for unwrapping.
-   *
-   * The encoding is based on the "newtypes" project by
-   * Alexander Konovalov, chosen because it's devoid of boxing issues and
-   * a good choice until opaque types will land in Scala.
-   */
-  type Par[E, +A] = Par.Type[E, A]
+  /**
+    * Newtype encoding for an `IO` datatype that has a `cats.Applicative`
+    * capable of doing parallel processing in `ap` and `map2`, needed
+    * for implementing `cats.Parallel`.
+    *
+    * Helpers are provided for converting back and forth in `Par.apply`
+    * for wrapping any `IO` value and `Par.unwrap` for unwrapping.
+    *
+    * The encoding is based on the "newtypes" project by
+    * Alexander Konovalov, chosen because it's devoid of boxing issues and
+    * a good choice until opaque types will land in Scala.
+    */
+  type Par[+E, +A] = Par.Type[E, A]
 
-  /** Newtype encoding, see the [[BIO.Par]] type alias
-   * for more details.
-   */
+  /**
+    * Newtype encoding, see the [[BIO.Par]] type alias
+    * for more details.
+    */
   object Par extends IONewtype
 }
 
@@ -452,7 +754,7 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
     override def attempt[A](ioa: BIO[E, A]): BIO[E, Either[E, A]] =
       ioa.attempt
     override def handleErrorWith[A](ioa: BIO[E, A])(f: E => BIO[E, A]): BIO[E, A] =
-      BIO.Bind(ioa, IOFrame.redeemer(f, BIO.pure[E, A]))
+      BIO.Bind(ioa, new IOFrame.ErrorHandler(f, BIO.pure[E, A]))
     override def raiseError[A](e: E): BIO[E, A] =
       BIO.raiseError(e)
 
@@ -463,8 +765,8 @@ private[effect] abstract class IOLowPriorityInstances extends IOParallelNewtype 
       }
 
     override def bracketCase[A, B](acquire: BIO[E, A])
-      (use: A => BIO[E, B])
-      (release: (A, ExitCase[E]) => BIO[E, Unit]): BIO[E, B] =
+                                  (use: A => BIO[E, B])
+                                  (release: (A, ExitCase[E]) => BIO[E, Unit]): BIO[E, B] =
       IOBracket(acquire)(use)(release)
   }
 }
@@ -475,14 +777,14 @@ private[effect] abstract class IOInstances extends IOLowPriorityInstances {
     def bimap[A, B, C, D](fab: BIO[A, B])(f: A => C, g: B => D): BIO[C, D] = fab.bimap(f, g)
   }
 
-  implicit def parApplicative[E <: AnyRef]: Applicative[BIO.Par[E, ?]] = new Applicative[BIO.Par[E, ?]] {
+  implicit def parApplicative[E <: AnyRef](implicit cs: ContextShift[BIO[E, ?]]): Applicative[BIO.Par[E, ?]] = new Applicative[BIO.Par[E, ?]] {
     import BIO.Par.unwrap
     import BIO.Par.{apply => par}
 
     override def pure[A](x: A): BIO.Par[E, A] =
       par(BIO.pure(x))
     override def map2[A, B, Z](fa: BIO.Par[E, A], fb: BIO.Par[E, B])(f: (A, B) => Z): BIO.Par[E, Z] =
-      par[E, Z](IOParMap(unwrap[E, A](fa), unwrap[E, B](fb))(f))
+      par[E, Z](IOParMap(cs, unwrap[E, A](fa), unwrap[E, B](fb))(f))
     override def ap[A, B](ff: BIO.Par[E, A => B])(fa: BIO.Par[E, A]): BIO.Par[E, B] =
       map2(ff, fa)(_(_))
     override def product[A, B](fa: BIO.Par[E, A], fb: BIO.Par[E, B]): BIO.Par[E, (A, B)] =
@@ -493,56 +795,84 @@ private[effect] abstract class IOInstances extends IOLowPriorityInstances {
       par(BIO.unit)
   }
 
-  implicit val ioConcurrentEffect: ConcurrentEffect[BIO[Throwable, ?]] = new ConcurrentEffect[BIO[Throwable, ?]] {
-    override def pure[A](a: A): BIO[Throwable, A] =
+  private[effect] class IOEffect extends Effect[BIO[Throwable, ?]] with StackSafeMonad[BIO[Throwable, ?]] {
+    final override def pure[A](a: A): BIO[Throwable, A] =
       BIO.pure(a)
-    override def flatMap[A, B](ioa: BIO[Throwable, A])(f: A => BIO[Throwable, B]): BIO[Throwable, B] =
-      ioa.flatMap(f)
-    override def map[A, B](fa: BIO[Throwable, A])(f: A => B): BIO[Throwable, B] =
-      fa.map(f)
-    override def delay[A](thunk: => A): BIO[Throwable, A] =
-      BIO(thunk)
-    override def unit: BIO[Throwable, Unit] =
+    final override def unit: BIO[Throwable, Unit] =
       BIO.unit
-    override def attempt[A](ioa: BIO[Throwable, A]): BIO[Throwable, Either[Throwable, A]] =
+
+    final override def map[A, B](fa: BIO[Throwable, A])(f: A => B): BIO[Throwable, B] =
+      fa.map(f)
+
+    final override def flatMap[A, B](ioa: BIO[Throwable, A])(f: A => BIO[Throwable, B]): BIO[Throwable, B] =
+      ioa.flatMap(f)
+
+    final override def attempt[A](ioa: BIO[Throwable, A]): BIO[Throwable, Either[Throwable, A]] =
       ioa.attempt
-    override def handleErrorWith[A](ioa: BIO[Throwable, A])(f: Throwable => BIO[Throwable, A]): BIO[Throwable, A] =
-      BIO.Bind(ioa, IOFrame.redeemer(f, BIO.pure[Throwable, A]))
-    override def raiseError[A](e: Throwable): BIO[Throwable, A] =
+    final override def handleErrorWith[A](ioa: BIO[Throwable, A])(f: Throwable => BIO[Throwable, A]): BIO[Throwable, A] =
+      ioa.handleErrorWith(f)
+    final override def raiseError[A](e: Throwable): BIO[Throwable, A] =
       BIO.raiseError(e)
-    override def suspend[A](thunk: => BIO[Throwable, A]): BIO[Throwable, A] =
+
+    final override def bracket[A, B](acquire: BIO[Throwable, A])
+                                    (use: A => BIO[Throwable, B])
+                                    (release: A => BIO[Throwable, Unit]): BIO[Throwable, B] =
+      acquire.bracket(use)(release)
+
+    final override def uncancelable[A](task: BIO[Throwable, A]): BIO[Throwable, A] =
+      task.uncancelable
+
+    final override def bracketCase[A, B](acquire: BIO[Throwable, A])
+                                        (use: A => BIO[Throwable, B])
+                                        (release: (A, ExitCase[Throwable]) => BIO[Throwable, Unit]): BIO[Throwable, B] =
+      acquire.bracketCase(use)(release)
+
+    final override def guarantee[A](fa: BIO[Throwable, A])(finalizer: BIO[Throwable, Unit]): BIO[Throwable, A] =
+      fa.guarantee(finalizer)
+
+    final override def guaranteeCase[A](fa: BIO[Throwable, A])(finalizer: ExitCase[Throwable] => BIO[Throwable, Unit]): BIO[Throwable, A] =
+      fa.guaranteeCase(finalizer)
+
+    final override def delay[A](thunk: => A): BIO[Throwable, A] =
+      BIO.delay(thunk)
+    final override def suspend[A](thunk: => BIO[Throwable, A]): BIO[Throwable, A] =
       BIO.suspend(thunk)
-    override def start[A](fa: BIO[Throwable, A]): BIO[Throwable, Fiber[BIO[Throwable, ?], A]] =
-      fa.start
-    override def uncancelable[A](fa: BIO[Throwable, A]): BIO[Throwable, A] =
-      fa.uncancelable
-    override def onCancelRaiseError[A](fa: BIO[Throwable, A], e: Throwable): BIO[Throwable, A] =
-      fa.onCancelRaiseError(e)
-    override def async[A](k: (Either[Throwable, A] => Unit) => Unit): BIO[Throwable, A] =
+
+    final override def async[A](k: (Either[Throwable, A] => Unit) => Unit): BIO[Throwable, A] =
       BIO.async(k)
-    override def race[A, B](fa: BIO[Throwable, A], fb: BIO[Throwable, B]): BIO[Throwable, Either[A, B]] =
-      BIO.race(fa, fb)
-    override def racePair[A, B](fa: BIO[Throwable, A], fb: BIO[Throwable, B]): BIO[Throwable, Either[(A, Fiber[BIO[Throwable, ?], B]), (Fiber[BIO[Throwable, ?], A], B)]] =
-      BIO.racePair(fa, fb)
-    override def runAsync[A](ioa: BIO[Throwable, A])(cb: Either[Throwable, A] => IO[Unit]): IO[Unit] =
-      BIO.toIO(ioa.runAsync(eta => liftIO(cb(eta))))
-    override def cancelable[A](k: (Either[Throwable, A] => Unit) => IO[Unit]): BIO[Throwable, A] =
-      BIO.cancelable(cb => liftIO(k(cb)))
-    override def runCancelable[A](fa: BIO[Throwable, A])(cb: Either[Throwable, A] => IO[Unit]): IO[IO[Unit]] =
-      BIO.toIO(fa.runCancelable(eta => liftIO(cb(eta))).map(BIO.toIO))
-    // this will use stack proportional to the maximum number of joined async suspensions
-    override def tailRecM[A, B](a: A)(f: A => BIO[Throwable, Either[A, B]]): BIO[Throwable, B] =
-      f(a) flatMap {
-        case Left(a) => tailRecM(a)(f)
-        case Right(b) => pure(b)
-      }
-    override def bracketCase[A, B](acquire: BIO[Throwable, A])
-                                  (use: A => BIO[Throwable, B])
-                                  (release: (A, ExitCase[Throwable]) => BIO[Throwable, Unit]): BIO[Throwable, B] =
-      IOBracket(acquire)(use)(release)
+    final override def asyncF[A](k: (Either[Throwable, A] => Unit) => BIO[Throwable, Unit]): BIO[Throwable, A] =
+      BIO.asyncF(k)
+
+    override def liftIO[A](ioa: IO[A]): BIO[Throwable, A] =
+      BIO.async(ioa.unsafeRunAsync)
+    override def toIO[A](fa: BIO[Throwable, A]): IO[A] =
+      IO.async(fa.unsafeRunAsync)
+    final override def runAsync[A](ioa: BIO[Throwable, A])(cb: Either[Throwable, A] => IO[Unit]): SyncIO[Unit] =
+      ioa.runAsync(cb.andThen(liftIO))
   }
 
-  implicit def ioParallel[E <: AnyRef]: Parallel[BIO[E, ?], BIO.Par[E, ?]] =
+  implicit def ioConcurrentEffect(implicit cs: ContextShift[BIO[Throwable, ?]]): ConcurrentEffect[BIO[Throwable, ?]] =
+    new IOEffect with ConcurrentEffect[BIO[Throwable, ?]] {
+      final override def start[A](fa: BIO[Throwable, A]): BIO[Throwable, Fiber[BIO[Throwable, ?], A]] =
+        fa.start
+
+      final override def race[A, B](fa: BIO[Throwable, A], fb: BIO[Throwable, B]): BIO[Throwable, Either[A, B]] =
+        BIO.race(fa, fb)
+
+      final override def racePair[A, B](fa: BIO[Throwable, A], fb: BIO[Throwable, B]): BIO[Throwable, Either[(A, Fiber[BIO[Throwable, ?], B]), (Fiber[BIO[Throwable, ?], A], B)]] =
+        BIO.racePair(fa, fb)
+
+      final override def cancelable[A](k: (Either[Throwable, A] => Unit) => BIO[Throwable, Unit]): BIO[Throwable, A] =
+        BIO.cancelable(k)
+      final override def runCancelable[A](fa: BIO[Throwable, A])(cb: Either[Throwable, A] => IO[Unit]): SyncIO[CancelToken[BIO[Throwable, ?]]] =
+        fa.runCancelable(cb.andThen(liftIO))
+
+      final override def toIO[A](fa: BIO[Throwable, A]): IO[A] = IO.async(fa.unsafeRunAsync)
+
+      final override def liftIO[A](ioa: IO[A]): BIO[Throwable, A] = BIO.async(ioa.unsafeRunAsync)
+    }
+
+  implicit def ioParallel[E <: AnyRef](implicit cs: ContextShift[BIO[E, ?]]): Parallel[BIO[E, ?], BIO.Par[E, ?]] =
     new Parallel[BIO[E, ?], BIO.Par[E, ?]] {
       override def applicative: Applicative[BIO.Par[E, ?]] =
         parApplicative
@@ -569,482 +899,553 @@ private[effect] abstract class IOInstances extends IOLowPriorityInstances {
 }
 
 /**
- * @define shiftDesc For example we can introduce an asynchronous
- *                   boundary in the `flatMap` chain before a certain task:
- *                   {{{
- *                              IO.shift.flatMap(_ => task)
- *                   }}}
- *
- *                   Or using Cats syntax:
- *                   {{{
- *                              import cats.syntax.all._
- *
- *                              IO.shift *> task
- *                   }}}
- *
- *                   Or we can specify an asynchronous boundary ''after'' the
- *                   evaluation of a certain task:
- *                   {{{
- *                              task.flatMap(a => IO.shift.map(_ => a))
- *                   }}}
- *
- *                   Or using Cats syntax:
- *                   {{{
- *                              task <* IO.shift
- *                   }}}
- *
- *                   Example of where this might be useful:
- *                   {{{
- *                            for {
- *                              _ <- IO.shift(BlockingIO)
- *                              bytes <- readFileUsingJavaIO(file)
- *                              _ <- IO.shift(DefaultPool)
- *
- *                              secure = encrypt(bytes, KeyManager)
- *                              _ <- sendResponse(Protocol.v1, secure)
- *
- *                              _ <- IO { println("it worked!") }
- *                            } yield ()
- *                   }}}
- *
- *                   In the above, `readFileUsingJavaIO` will be shifted to the
- *                   pool represented by `BlockingIO`, so long as it is defined
- *                   using `apply` or `suspend` (which, judging by the name, it
- *                   probably is).  Once its computation is complete, the rest
- *                   of the `for`-comprehension is shifted ''again'', this time
- *                   onto the `DefaultPool`.  This pool is used to compute the
- *                   encrypted version of the bytes, which are then passed to
- *                   `sendResponse`.  If we assume that `sendResponse` is
- *                   defined using `async` (perhaps backed by an NIO socket
- *                   channel), then we don't actually know on which pool the
- *                   final `IO` action (the `println`) will be run.  If we
- *                   wanted to ensure that the `println` runs on `DefaultPool`,
- *                   we would insert another `shift` following `sendResponse`.
- *
- *                   Another somewhat less common application of `shift` is to
- *                   reset the thread stack and yield control back to the
- *                   underlying pool. For example:
- *
- *                   {{{
- *                            lazy val repeat: IO[Unit] = for {
- *                              _ <- doStuff
- *                              _ <- IO.shift
- *                              _ <- repeat
- *                            } yield ()
- *                   }}}
- *
- *                   In this example, `repeat` is a very long running `IO`
- *                   (infinite, in fact!) which will just hog the underlying
- *                   thread resource for as long as it continues running.  This
- *                   can be a bit of a problem, and so we inject the `IO.shift`
- *                   which yields control back to the underlying thread pool,
- *                   giving it a chance to reschedule things and provide better
- *         fairness.  This shifting also "bounces" the thread stack,
- *                   popping all the way back to the thread pool and effectively
- *                   trampolining the remainder of the computation.  This sort
- *                   of manual trampolining is unnecessary if `doStuff` is
- *                   defined using `suspend` or `apply`, but if it was defined
- *                   using `async` and does ''not'' involve any real
- *                   concurrency, the call to `shift` will be necessary to avoid
- *                   a `StackOverflowError`.
- *
- *                   Thus, this function has four important use cases:
- *
- *          - shifting blocking actions off of the main compute pool,
- *          - defensively re-shifting asynchronous continuations back
- *                   to the main compute pool
- *          - yielding control to some underlying pool for fairness
- *                   reasons, and
- *          - preventing an overflow of the call stack in the case of
- *                   improperly constructed `async` actions
- *
- *                   Note there are 2 overloads of this function:
- *
- *          - one that takes an [[Timer]] ([[BIO.shift(implicit* link]])
- *          - one that takes a Scala `ExecutionContext` ([[BIO.shift(ec* link]])
- *
- *                   Use the former by default, use the later for fine grained
- *                   control over the thread pool used.
- */
+  * @define shiftDesc For example we can introduce an asynchronous
+  *                   boundary in the `flatMap` chain before a certain task:
+  *                   {{{
+  *                              IO.shift.flatMap(_ => task)
+  *                   }}}
+  *
+  *                   Or using Cats syntax:
+  *                   {{{
+  *                              import cats.syntax.all._
+  *
+  *                              IO.shift *> task
+  *                   }}}
+  *
+  *                   Or we can specify an asynchronous boundary ''after'' the
+  *                   evaluation of a certain task:
+  *                   {{{
+  *                              task.flatMap(a => IO.shift.map(_ => a))
+  *                   }}}
+  *
+  *                   Or using Cats syntax:
+  *                   {{{
+  *                              task <* IO.shift
+  *                   }}}
+  *
+  *                   Example of where this might be useful:
+  *                   {{{
+  *                            for {
+  *                              _ <- IO.shift(BlockingIO)
+  *                              bytes <- readFileUsingJavaIO(file)
+  *                              _ <- IO.shift(DefaultPool)
+  *
+  *                              secure = encrypt(bytes, KeyManager)
+  *                              _ <- sendResponse(Protocol.v1, secure)
+  *
+  *                              _ <- IO { println("it worked!") }
+  *                            } yield ()
+  *                   }}}
+  *
+  *                   In the above, `readFileUsingJavaIO` will be shifted to the
+  *                   pool represented by `BlockingIO`, so long as it is defined
+  *                   using `apply` or `suspend` (which, judging by the name, it
+  *                   probably is).  Once its computation is complete, the rest
+  *                   of the `for`-comprehension is shifted ''again'', this time
+  *                   onto the `DefaultPool`.  This pool is used to compute the
+  *                   encrypted version of the bytes, which are then passed to
+  *                   `sendResponse`.  If we assume that `sendResponse` is
+  *                   defined using `async` (perhaps backed by an NIO socket
+  *                   channel), then we don't actually know on which pool the
+  *                   final `IO` action (the `println`) will be run.  If we
+  *                   wanted to ensure that the `println` runs on `DefaultPool`,
+  *                   we would insert another `shift` following `sendResponse`.
+  *
+  *                   Another somewhat less common application of `shift` is to
+  *                   reset the thread stack and yield control back to the
+  *                   underlying pool. For example:
+  *
+  *                   {{{
+  *                            lazy val repeat: IO[Unit] = for {
+  *                              _ <- doStuff
+  *                              _ <- IO.shift
+  *                              _ <- repeat
+  *                            } yield ()
+  *                   }}}
+  *
+  *                   In this example, `repeat` is a very long running `IO`
+  *                   (infinite, in fact!) which will just hog the underlying
+  *                   thread resource for as long as it continues running.  This
+  *                   can be a bit of a problem, and so we inject the `IO.shift`
+  *                   which yields control back to the underlying thread pool,
+  *                   giving it a chance to reschedule things and provide better
+  *         fairness.  This shifting also "bounces" the thread stack,
+  *                   popping all the way back to the thread pool and effectively
+  *                   trampolining the remainder of the computation.  This sort
+  *                   of manual trampolining is unnecessary if `doStuff` is
+  *                   defined using `suspend` or `apply`, but if it was defined
+  *                   using `async` and does ''not'' involve any real
+  *                   concurrency, the call to `shift` will be necessary to avoid
+  *                   a `StackOverflowError`.
+  *
+  *                   Thus, this function has four important use cases:
+  *
+  *          - shifting blocking actions off of the main compute pool,
+  *          - defensively re-shifting asynchronous continuations back
+  *                   to the main compute pool
+  *          - yielding control to some underlying pool for fairness
+  *                   reasons, and
+  *          - preventing an overflow of the call stack in the case of
+  *                   improperly constructed `async` actions
+  *
+  *                   Note there are 2 overloads of this function:
+  *
+  *          - one that takes an [[Timer]] ([[BIO.shift(implicit* link]])
+  *          - one that takes a Scala `ExecutionContext` ([[BIO.shift(ec* link]])
+  *
+  *                   Use the former by default, use the later for fine grained
+  *                   control over the thread pool used.
+  */
 object BIO extends IOInstances {
 
   /**
-   * Suspends a synchronous side effect in `IO`.
-   *
-   * Any exceptions thrown by the effect will be caught and sequenced
-   * into the `IO`.
-   */
+    * Suspends a synchronous side effect in `IO`.
+    *
+    * Alias for `IO.delay(body)`.
+    */
   def apply[A](body: => A): BIO[Throwable, A] = Delay(body _, identity)
 
 
-  def unsafeNoCatch[E, A](body: => A): BIO[E, A] = Delay(body _, _.asInstanceOf)
+  def unsafeDelay[E, A](body: => A): BIO[E, A] = Delay(body _, _.asInstanceOf)
+
+  def unsafeSuspend[E, A](body: => BIO[E, A]): BIO[E, A] = unsafeDelay(body).flatMap(identity)
 
   /**
-   * Suspends a synchronous side effect which produces an `IO` in `IO`.
-   *
-   * This is useful for trampolining (i.e. when the side effect is
-   * conceptually the allocation of a stack frame).  Any exceptions
-   * thrown by the side effect will be caught and sequenced into the
-   * `IO`.
-   */
-  def suspend[E, A](thunk: => BIO[Throwable, A]): BIO[Throwable, A] =
+    * Suspends a synchronous side effect in `IO`.
+    *
+    * Any exceptions thrown by the effect will be caught and sequenced
+    * into the `IO`.
+    */
+  def delay[A](body: => A): BIO[Throwable, A] =
+    BIO(body)
+
+  /**
+    * Suspends a synchronous side effect which produces an `IO` in `IO`.
+    *
+    * This is useful for trampolining (i.e. when the side effect is
+    * conceptually the allocation of a stack frame).  Any exceptions
+    * thrown by the side effect will be caught and sequenced into the
+    * `IO`.
+    */
+  def suspend[A](thunk: => BIO[Throwable, A]): BIO[Throwable, A] =
     Suspend(thunk _, identity)
 
   /**
-   * Suspends a pure value in `IO`.
-   *
-   * This should ''only'' be used if the value in question has
-   * "already" been computed!  In other words, something like
-   * `IO.pure(readLine)` is most definitely not the right thing to do!
-   * However, `IO.pure(42)` is correct and will be more efficient
-   * (when evaluated) than `IO(42)`, due to avoiding the allocation of
-   * extra thunks.
-   */
+    * Suspends a pure value in `IO`.
+    *
+    * This should ''only'' be used if the value in question has
+    * "already" been computed!  In other words, something like
+    * `IO.pure(readLine)` is most definitely not the right thing to do!
+    * However, `IO.pure(42)` is correct and will be more efficient
+    * (when evaluated) than `IO(42)`, due to avoiding the allocation of
+    * extra thunks.
+    */
   def pure[E, A](a: A): BIO[E, A] = Pure(a)
 
   /** Alias for `IO.pure(())`. */
   def unit[E]: BIO[E, Unit] = pure(())
 
   /**
-   * A non-terminating `IO`, alias for `async(_ => ())`.
-   */
+    * A non-terminating `IO`, alias for `async(_ => ())`.
+    */
   def never[E]: BIO[E, Nothing] = async(_ => ())
 
   /**
-   * Lifts an `Eval` into `IO`.
-   *
-   * This function will preserve the evaluation semantics of any
-   * actions that are lifted into the pure `IO`.  Eager `Eval`
-   * instances will be converted into thunk-less `IO` (i.e. eager
-   * `IO`), while lazy eval and memoized will be executed as such.
-   */
+    * Lifts an `Eval` into `IO`.
+    *
+    * This function will preserve the evaluation semantics of any
+    * actions that are lifted into the pure `IO`.  Eager `Eval`
+    * instances will be converted into thunk-less `IO` (i.e. eager
+    * `IO`), while lazy eval and memoized will be executed as such.
+    */
   def eval[A](fa: Eval[A]): BIO[Throwable, A] = fa match {
     case Now(a) => pure(a)
     case notNow => apply(notNow.value)
   }
 
+
   /**
-   * Suspends an asynchronous side effect in `IO`.
-   *
-   * The given function will be invoked during evaluation of the `IO`
-   * to "schedule" the asynchronous callback, where the callback is
-   * the parameter passed to that function.  Only the ''first''
-   * invocation of the callback will be effective!  All subsequent
-   * invocations will be silently dropped.
-   *
-   * As a quick example, you can use this function to perform a
-   * parallel computation given an `ExecutorService`:
-   *
-   * {{{
-   * def fork[A](body: => A)(implicit E: ExecutorService): IO[A] = {
-   *   IO async { cb =>
-   *     E.execute(new Runnable {
-   *       def run() =
-   *         try cb(Right(body)) catch { case NonFatal(t) => cb(Left(t)) }
-   *     })
-   *   }
-   * }
-   * }}}
-   *
-   * The `fork` function will do exactly what it sounds like: take a
-   * thunk and an `ExecutorService` and run that thunk on the thread
-   * pool.  Or rather, it will produce an `IO` which will do those
-   * things when run; it does *not* schedule the thunk until the
-   * resulting `IO` is run!  Note that there is no thread blocking in
-   * this implementation; the resulting `IO` encapsulates the callback
-   * in a pure and monadic fashion without using threads.
-   *
-   * This function can be thought of as a safer, lexically-constrained
-   * version of `Promise`, where `IO` is like a safer, lazy version of
-   * `Future`.
-   */
+    * Suspends an asynchronous side effect in `IO`.
+    *
+    * The given function will be invoked during evaluation of the `IO`
+    * to "schedule" the asynchronous callback, where the callback is
+    * the parameter passed to that function.  Only the ''first''
+    * invocation of the callback will be effective!  All subsequent
+    * invocations will be silently dropped.
+    *
+    * As a quick example, you can use this function to perform a
+    * parallel computation given an `ExecutorService`:
+    *
+    * {{{
+    * def fork[A](body: => A)(implicit E: ExecutorService): IO[A] = {
+    *   IO async { cb =>
+    *     E.execute(new Runnable {
+    *       def run() =
+    *         try cb(Right(body)) catch { case NonFatal(t) => cb(Left(t)) }
+    *     })
+    *   }
+    * }
+    * }}}
+    *
+    * The `fork` function will do exactly what it sounds like: take a
+    * thunk and an `ExecutorService` and run that thunk on the thread
+    * pool.  Or rather, it will produce an `IO` which will do those
+    * things when run; it does *not* schedule the thunk until the
+    * resulting `IO` is run!  Note that there is no thread blocking in
+    * this implementation; the resulting `IO` encapsulates the callback
+    * in a pure and monadic fashion without using threads.
+    *
+    * This function can be thought of as a safer, lexically-constrained
+    * version of `Promise`, where `IO` is like a safer, lazy version of
+    * `Future`.
+    *
+    * @see [[asyncF]] and [[cancelable]]
+    */
   def async[E, A](k: (Either[E, A] => Unit) => Unit): BIO[E, A] = {
-    Async[E, A] { (_, cb) =>
-      val cb2 = Callback.asyncIdempotent(null, cb)
+    Async [E, A]{ (_, cb) =>
+      val cb2 = Callback.asyncIdempotent[E, A](null, cb)
       try k(cb2) catch { case NonFatal(t) => Logger.reportFailure(t) }
     }
   }
 
   /**
-   * Builds a cancelable `IO`.
-   */
-  def cancelable[E, A](k: (Either[E, A] => Unit) => BIO[Throwable, Unit]): BIO[E, A] =
+    * Suspends an asynchronous side effect in `IO`, this being a variant
+    * of [[async]] that takes a pure registration function.
+    *
+    * Implements [[cats.effect.Async.asyncF Async.asyncF]].
+    *
+    * The difference versus [[async]] is that this variant can suspend
+    * side-effects via the provided function parameter. It's more relevant
+    * in polymorphic code making use of the [[cats.effect.Async Async]]
+    * type class, as it alleviates the need for [[Effect]].
+    *
+    * Contract for the returned `IO[Unit]` in the provided function:
+    *
+    *  - can be asynchronous
+    *  - can be cancelable, in which case it hooks into IO's cancelation
+    *    mechanism such that the resulting task is cancelable
+    *  - it should not end in error, because the provided callback
+    *    is the only way to signal the final result and it can only
+    *    be called once, so invoking it twice would be a contract
+    *    violation; so on errors thrown in `IO`, the task can become
+    *    non-terminating, with the error being printed to stderr
+    *
+    * @see [[async]] and [[cancelable]]
+    */
+  def asyncF[E, A](k: (Either[E, A] => Unit) => BIO[E, Unit]): BIO[E, A] =
     Async[E, A] { (conn, cb) =>
+      // Must create new connection, otherwise we can have a race
+      // condition b/t the bind continuation and `startCancelable` below
+      val conn2 = IOConnection[E]()
+      conn.push(conn2.cancel)
+      // The callback handles "conn.pop()"
       val cb2 = Callback.asyncIdempotent(conn, cb)
-      val ref = ForwardCancelable()
-      conn.push(ref)
-
-      ref := (
-        try k(cb2) catch { case NonFatal(t) =>
-          Logger.reportFailure(t)
-          BIO.unit
-        })
+      val fa = k(cb)
+      IORunLoop.startCancelable(fa, conn2, Callback.report)
     }
 
   /**
-   * Constructs an `IO` which sequences the specified exception.
-   *
-   * If this `IO` is run using `unsafeRunSync` or `unsafeRunTimed`,
-   * the exception will be thrown.  This exception can be "caught" (or
-   * rather, materialized into value-space) using the `attempt`
-   * method.
-   *
-   * @see [[BIO#attempt]]
-   */
+    * Builds a cancelable `IO`.
+    *
+    * Implements [[Concurrent.cancelable]].
+    *
+    * The provided function takes a side effectful callback that's
+    * supposed to be registered in async apis for signaling a final
+    * result.
+    *
+    * The provided function also returns an `IO[Unit]` that represents
+    * the cancelation token, the logic needed for canceling the
+    * running computations.
+    *
+    * Example:
+    *
+    * {{{
+    *   import java.util.concurrent.ScheduledExecutorService
+    *   import scala.concurrent.duration._
+    *
+    *   def sleep(d: FiniteDuration)(implicit ec: ScheduledExecutorService): IO[Unit] =
+    *     IO.cancelable { cb =>
+    *       // Schedules task to run after delay
+    *       val run = new Runnable { def run() = cb(Right(())) }
+    *       val future = ec.schedule(run, d.length, d.unit)
+    *
+    *       // Cancellation logic, suspended in IO
+    *       IO(future.cancel(true))
+    *     }
+    * }}}
+    *
+    * This example is for didactic purposes, you don't need to describe
+    * this function, as it's already available in [[BIO.sleep]].
+    *
+    * @see [[async]] for a simpler variant that builds non-cancelable,
+    *      async tasks
+    * @see [[asyncF]] for a more potent version that does hook into
+    *      the underlying cancelation model
+    */
+  def cancelable[E, A](k: (Either[E, A] => Unit) => CancelToken[BIO[E, ?]]): BIO[E, A] =
+    Async[E, A] { (conn, cb) =>
+      val cb2 = Callback.asyncIdempotent(conn, cb)
+      val ref = ForwardCancelable[E]()
+      conn.push(ref.cancel)
+      // Race condition test — no need to execute `k` if it was already cancelled,
+      // ensures that fiber.cancel will always wait for the finalizer if `k`
+      // is executed — note that `isCanceled` is visible here due to `push`
+      if (!conn.isCanceled)
+        ref.complete(k(cb2))
+      else
+        ref.complete(BIO.unit[E])
+    }
+
+  /**
+    * Constructs an `IO` which sequences the specified exception.
+    *
+    * If this `IO` is run using `unsafeRunSync` or `unsafeRunTimed`,
+    * the exception will be thrown.  This exception can be "caught" (or
+    * rather, materialized into value-space) using the `attempt`
+    * method.
+    *
+    * @see [[BIO#attempt]]
+    */
   def raiseError[E, A](e: E): BIO[E, A] = RaiseError(e)
 
   /**
-   * Constructs an `IO` which evaluates the given `Future` and
-   * produces the result (or failure).
-   *
-   * Because `Future` eagerly evaluates, as well as because it
-   * memoizes, this function takes its parameter as an `IO`,
-   * which could be lazily evaluated.  If this laziness is
-   * appropriately threaded back to the definition site of the
-   * `Future`, it ensures that the computation is fully managed by
-   * `IO` and thus referentially transparent.
-   *
-   * Example:
-   *
-   * {{{
-   *   // Lazy evaluation, equivalent with by-name params
-   *   IO.fromFuture(IO(f))
-   *
-   *   // Eager evaluation, for pure futures
-   *   IO.fromFuture(IO.pure(f))
-   * }}}
-   *
-   * Roughly speaking, the following identities hold:
-   *
-   * {{{
-   * IO.fromFuture(IO(f)).unsafeToFuture() === f // true-ish (except for memoization)
-   * IO.fromFuture(IO(ioa.unsafeToFuture())) === ioa // true
-   * }}}
-   *
-   * @see [[BIO#unsafeToFuture]]
-   */
+    * Constructs an `IO` which evaluates the given `Future` and
+    * produces the result (or failure).
+    *
+    * Because `Future` eagerly evaluates, as well as because it
+    * memoizes, this function takes its parameter as an `IO`,
+    * which could be lazily evaluated.  If this laziness is
+    * appropriately threaded back to the definition site of the
+    * `Future`, it ensures that the computation is fully managed by
+    * `IO` and thus referentially transparent.
+    *
+    * Example:
+    *
+    * {{{
+    *   // Lazy evaluation, equivalent with by-name params
+    *   IO.fromFuture(IO(f))
+    *
+    *   // Eager evaluation, for pure futures
+    *   IO.fromFuture(IO.pure(f))
+    * }}}
+    *
+    * Roughly speaking, the following identities hold:
+    *
+    * {{{
+    * IO.fromFuture(IO(f)).unsafeToFuture() === f // true-ish (except for memoization)
+    * IO.fromFuture(IO(ioa.unsafeToFuture())) === ioa // true
+    * }}}
+    *
+    * @see [[BIO#unsafeToFuture]]
+    */
   def fromFuture[A](iof: BIO[Throwable, Future[A]]): BIO[Throwable, A] =
-    iof.flatMap { f =>
-      BIO.async { cb =>
-        f.onComplete(r => cb(r match {
-          case Success(a) => Right(a)
-          case Failure(e) => Left(e)
-        }))(immediate)
-      }
-    }
+    iof.flatMap(IOFromFuture.apply)
 
   /**
-   * Lifts an Either[Throwable, A] into the IO[A] context raising the throwable
-   * if it exists.
-   */
+    * Lifts an `Either[Throwable, A]` into the `IO[A]` context, raising
+    * the throwable if it exists.
+    */
   def fromEither[E, A](e: Either[E, A]): BIO[E, A] =
     e match {
       case Right(a) => pure(a)
       case Left(err) => raiseError(err)
     }
 
-
-  def toIO[A](fa: BIO[Throwable, A]): IO[A] =
-    IO.async(fa.unsafeRunAsync)
+  /**
+    * Asynchronous boundary described as an effectful `IO`, managed
+    * by the provided [[ContextShift]].
+    *
+    * This operation can be used in `flatMap` chains to "shift" the
+    * continuation of the run-loop to another thread or call stack.
+    *
+    * $shiftDesc
+    *
+    * @param cs is the [[ContextShift]] that's managing the thread-pool
+    *        used to trigger this async boundary
+    */
+  def shift[E](implicit cs: ContextShift[BIO[E, ?]]): BIO[E, Unit] =
+    cs.shift
 
   /**
-   * Asynchronous boundary described as an effectful `IO`, managed
-   * by the provided [[Timer]].
-   *
-   * This operation can be used in `flatMap` chains to "shift" the
-   * continuation of the run-loop to another thread or call stack.
-   *
-   * $shiftDesc
-   *
-   * @param timer is the [[Timer]] that's managing the thread-pool
-   *        used to trigger this async boundary
-   */
-  def shift[E](implicit timer: Timer[BIO[E, ?]]): BIO[E, Unit] =
-    timer.shift
+    * Asynchronous boundary described as an effectful `IO`, managed
+    * by the provided Scala `ExecutionContext`.
+    *
+    * This operation can be used in `flatMap` chains to "shift" the
+    * continuation of the run-loop to another thread or call stack.
+    *
+    * $shiftDesc
+    *
+    * @param ec is the Scala `ExecutionContext` that's managing the
+    *        thread-pool used to trigger this async boundary
+    */
+  def shift[E](ec: ExecutionContext): BIO[E, Unit] =
+    IOShift(ec)
 
   /**
-   * Asynchronous boundary described as an effectful `IO`, managed
-   * by the provided Scala `ExecutionContext`.
-   *
-   * This operation can be used in `flatMap` chains to "shift" the
-   * continuation of the run-loop to another thread or call stack.
-   *
-   * $shiftDesc
-   *
-   * @param ec is the Scala `ExecutionContext` that's managing the
-   *        thread-pool used to trigger this async boundary
-   */
-  def shift(ec: ExecutionContext): BIO[Throwable, Unit] = {
-    BIO.Async { (_, cb: Either[Throwable, Unit] => Unit) =>
-      ec.execute(new Runnable {
-        def run() = cb(Callback.rightUnit)
-      })
-    }
-  }
-
-  /**
-   * Creates an asynchronous task that on evaluation sleeps for the
-   * specified duration, emitting a notification on completion.
-   *
-   * This is the pure, non-blocking equivalent to:
-   *
-   *  - `Thread.sleep` (JVM)
-   *  - `ScheduledExecutorService.schedule` (JVM)
-   *  - `setTimeout` (JavaScript)
-   *
-   * Similar with [[BIO.shift(implicit* IO.shift]], you can combine it
-   * via `flatMap` to create delayed tasks:
-   *
-   * {{{
-   *   val timeout = IO.sleep(10.seconds).flatMap { _ =>
-   *     IO.raiseError(new TimeoutException)
-   *   }
-   * }}}
-   *
-   * This operation creates an asynchronous boundary, even if the
-   * specified duration is zero, so you can count on this equivalence:
-   *
-   * {{{
-   *   IO.sleep(Duration.Zero) <-> IO.shift
-   * }}}
-   *
-   * The created task is cancelable and so it can be used safely in race
-   * conditions without resource leakage.
-   *
-   * @param duration is the time span to wait before emitting the tick
-   * @param timer is the [[Timer]] used to manage this delayed task,
-   *        `IO.sleep` being in fact just an alias for [[Timer.sleep]]
-   * @return a new asynchronous and cancelable `IO` that will sleep for
-   *         the specified duration and then finally emit a tick
-   */
+    * Creates an asynchronous task that on evaluation sleeps for the
+    * specified duration, emitting a notification on completion.
+    *
+    * This is the pure, non-blocking equivalent to:
+    *
+    *  - `Thread.sleep` (JVM)
+    *  - `ScheduledExecutorService.schedule` (JVM)
+    *  - `setTimeout` (JavaScript)
+    *
+    * Similar with [[BIO.shift(implicit* IO.shift]], you can combine it
+    * via `flatMap` to create delayed tasks:
+    *
+    * {{{
+    *   val timeout = IO.sleep(10.seconds).flatMap { _ =>
+    *     IO.raiseError(new TimeoutException)
+    *   }
+    * }}}
+    *
+    * This operation creates an asynchronous boundary, even if the
+    * specified duration is zero, so you can count on this equivalence:
+    *
+    * {{{
+    *   IO.sleep(Duration.Zero) <-> IO.shift
+    * }}}
+    *
+    * The created task is cancelable and so it can be used safely in race
+    * conditions without resource leakage.
+    *
+    * @param duration is the time span to wait before emitting the tick
+    * @param timer is the [[Timer]] used to manage this delayed task,
+    *        `IO.sleep` being in fact just an alias for [[Timer.sleep]]
+    * @return a new asynchronous and cancelable `IO` that will sleep for
+    *         the specified duration and then finally emit a tick
+    */
   def sleep[E](duration: FiniteDuration)(implicit timer: Timer[BIO[E, ?]]): BIO[E, Unit] =
     timer.sleep(duration)
 
   /**
-   * Returns a cancelable boundary — an `IO` task that checks for the
-   * cancelation status of the run-loop and does not allow for the
-   * bind continuation to keep executing in case cancelation happened.
-   *
-   * This operation is very similar to [[BIO.shift(implicit* IO.shift]],
-   * as it can be dropped in `flatMap` chains in order to make loops
-   * cancelable.
-   *
-   * Example:
-   *
-   * {{{
-   *  def fib(n: Int, a: Long, b: Long): IO[Long] =
-   *    IO.suspend {
-   *      if (n <= 0) IO.pure(a) else {
-   *        val next = fib(n - 1, b, a + b)
-   *
-   *        // Every 100-th cycle, check cancelation status
-   *        if (n % 100 == 0)
-   *          IO.cancelBoundary *> next
-   *        else
-   *          next
-   *      }
-   *    }
-   * }}}
-   */
-  def cancelBoundary[E]: BIO[E, Unit] = {
-    BIO.Async[E, Unit] { (conn, cb) =>
-      if (!conn.isCanceled)
-        cb.async(Callback.rightUnit)
-    }
+    * Returns a cancelable boundary — an `IO` task that checks for the
+    * cancellation status of the run-loop and does not allow for the
+    * bind continuation to keep executing in case cancellation happened.
+    *
+    * This operation is very similar to [[BIO.shift(implicit* IO.shift]],
+    * as it can be dropped in `flatMap` chains in order to make loops
+    * cancelable.
+    *
+    * Example:
+    *
+    * {{{
+    *  def fib(n: Int, a: Long, b: Long): IO[Long] =
+    *    IO.suspend {
+    *      if (n <= 0) IO.pure(a) else {
+    *        val next = fib(n - 1, b, a + b)
+    *
+    *        // Every 100-th cycle, check cancellation status
+    *        if (n % 100 == 0)
+    *          IO.cancelBoundary *> next
+    *        else
+    *          next
+    *      }
+    *    }
+    * }}}
+    */
+  val cancelBoundary: BIO[Nothing, Unit] = {
+    val start: Start[Nothing, Unit] = (_, cb) => cb(Callback.rightUnit)
+    Async[Nothing, Unit](start, trampolineAfter = true)
   }
 
   /**
-   * Run two IO tasks concurrently, and return the first to
-   * finish, either in success or error. The loser of the race is
-   * cancelled.
-   *
-   * The two tasks are executed in parallel if asynchronous,
-   * the winner being the first that signals a result.
-   *
-   * As an example, this is how a `timeout` operation could be
-   * implemented in terms of `race`:
-   *
-   * {{{
-   *   import cats.effect._
-   *   import scala.concurrent.duration._
-   *
-   *   def timeoutTo[A](io: IO[A], after: FiniteDuration, fallback: IO[A])
-   *     (implicit timer: Timer[IO]): IO[A] = {
-   *
-   *     IO.race(io, timer.sleep(after)).flatMap {
-   *       case Left((a, _)) => IO.pure(a)
-   *       case Right((_, _)) => fallback
-   *     }
-   *   }
-   *
-   *   def timeout[A](io: IO[A], after: FiniteDuration)
-   *     (implicit timer: Timer[IO]): IO[A] = {
-   *
-   *     timeoutTo(io, after,
-   *       IO.raiseError(new TimeoutException(after.toString)))
-   *   }
-   * }}}
-   *
-   * N.B. this is the implementation of [[Concurrent.race]].
-   *
-   * Also see [[racePair]] for a version that does not cancel
-   * the loser automatically on successful results.
-   */
-  def race[E, A, B](lh: BIO[E, A], rh: BIO[E, B]): BIO[E, Either[A, B]] =
-    IORace.simple(lh, rh)
+    * Run two IO tasks concurrently, and return the first to
+    * finish, either in success or error. The loser of the race is
+    * canceled.
+    *
+    * The two tasks are executed in parallel if asynchronous,
+    * the winner being the first that signals a result.
+    *
+    * As an example see [[BIO.timeout]] and [[BIO.timeoutTo]]
+    *
+    * N.B. this is the implementation of [[Concurrent.race]].
+    *
+    * Also see [[racePair]] for a version that does not cancel
+    * the loser automatically on successful results.
+    *
+    * @param lh is the "left" task participating in the race
+    * @param rh is the "right" task participating in the race
+    * @param cs is an implicit requirement needed because
+    *        `race` automatically forks the involved tasks
+    */
+  def race[E, A, B](lh: BIO[E, A], rh: BIO[E, B])(implicit cs: ContextShift[BIO[E, ?]]): BIO[E, Either[A, B]] =
+    IORace.simple(cs, lh, rh)
 
   /**
-   * Run two IO tasks concurrently, and returns a pair
-   * containing both the winner's successful value and the loser
-   * represented as a still-unfinished task.
-   *
-   * If the first task completes in error, then the result will
-   * complete in error, the other task being cancelled.
-   *
-   * On usage the user has the option of cancelling the losing task,
-   * this being equivalent with plain [[race]]:
-   *
-   * {{{
-   *   val ioA: IO[A] = ???
-   *   val ioB: IO[B] = ???
-   *
-   *   IO.racePair(ioA, ioB).flatMap {
-   *     case Left((a, fiberB)) =>
-   *       fiberB.cancel.map(_ => a)
-   *     case Right((fiberA, b)) =>
-   *       fiberA.cancel.map(_ => b)
-   *   }
-   * }}}
-   *
-   * N.B. this is the implementation of [[Concurrent.racePair]].
-   *
-   * See [[race]] for a simpler version that cancels the loser
-   * immediately.
-   */
-  def racePair[E, A, B](lh: BIO[E, A], rh: BIO[E, B]): BIO[E, Either[(A, Fiber[BIO[E, ?], B]), (Fiber[BIO[E, ?], A], B)]] =
-    IORace.pair(lh, rh)
+    * Run two IO tasks concurrently, and returns a pair
+    * containing both the winner's successful value and the loser
+    * represented as a still-unfinished task.
+    *
+    * If the first task completes in error, then the result will
+    * complete in error, the other task being canceled.
+    *
+    * On usage the user has the option of canceling the losing task,
+    * this being equivalent with plain [[race]]:
+    *
+    * {{{
+    *   val ioA: IO[A] = ???
+    *   val ioB: IO[B] = ???
+    *
+    *   IO.racePair(ioA, ioB).flatMap {
+    *     case Left((a, fiberB)) =>
+    *       fiberB.cancel.map(_ => a)
+    *     case Right((fiberA, b)) =>
+    *       fiberA.cancel.map(_ => b)
+    *   }
+    * }}}
+    *
+    * N.B. this is the implementation of [[Concurrent.racePair]].
+    *
+    * See [[race]] for a simpler version that cancels the loser
+    * immediately.
+    *
+    * @param lh is the "left" task participating in the race
+    * @param rh is the "right" task participating in the race
+    * @param cs is an implicit requirement needed because
+    *        `race` automatically forks the involved tasks
+    */
+  def racePair[E, A, B](lh: BIO[E, A], rh: BIO[E, B])(implicit cs: ContextShift[BIO[E, ?]]): BIO[E, Either[(A, Fiber[BIO[E, ?], B]), (Fiber[BIO[E, ?], A], B)]] =
+    IORace.pair(cs, lh, rh)
 
+  /**
+    * Returns a [[ContextShift]] instance for [[BIO]], built from a
+    * Scala `ExecutionContext`.
+    *
+    * NOTE: you don't need to build such instances when using [[IOApp]].
+    *
+    * @param ec is the execution context used for the actual execution of
+    *        tasks (e.g. bind continuations) and can be backed by the
+    *        user's own thread-pool
+    */
+  def contextShift[E](ec: ExecutionContext): ContextShift[BIO[E, ?]] =
+    IOContextShift(ec)
+
+  /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= */
+  /* IO's internal encoding: */
+
+  /** Corresponds to [[BIO.pure]]. */
   private[effect] final case class Pure[E, +A](a: A)
     extends BIO[E, A]
 
+  /** Corresponds to [[BIO.apply]]. */
   private[effect] final case class Delay[E, +A](thunk: () => A, f: Throwable => E)
     extends BIO[E, A]
 
+  /** Corresponds to [[BIO.raiseError]]. */
   private[effect] final case class RaiseError[E](e: E)
     extends BIO[E, Nothing]
+
+  /** Corresponds to [[BIO.suspend]]. */
   private[effect] final case class Suspend[E, +A](thunk: () => BIO[E, A], f: Throwable => E)
     extends BIO[E, A]
 
+  /** Corresponds to [[BIO.flatMap]]. */
   private[effect] final case class Bind[R, E, E1, +A](source: BIO[E, R], f: R => BIO[E1, A])
     extends BIO[E1, A]
 
-  private[effect] final case class Async[E, +A](k: (IOConnection, Either[E, A] => Unit) => Unit)
-    extends BIO[E, A]
-
-  /** State for representing `map` ops that itself is a function in
-   * order to avoid extraneous memory allocations when building the
-   * internal call-stack.
-   */
+  /** Corresponds to [[BIO.map]]. */
   private[effect] final case class Map[X, E, +A](source: BIO[X, E], f: E => A, index: Int)
     extends BIO[X, A] with (E => BIO[X, A]) {
 
@@ -1052,9 +1453,43 @@ object BIO extends IOInstances {
       BIO.pure(f(value))
   }
 
-  /** Internal reference, used as an optimization for [[BIO.attempt]]
-   * in order to avoid extraneous memory allocations.
-   */
+  /**
+    * Corresponds to [[BIO.async]] and other async definitions
+    * (e.g. [[BIO.race]], [[BIO.shift]], etc)
+    *
+    * @param k is the "registration" function that starts the
+    *        async process — receives an [[internals.IOConnection[E]]]
+    *        that keeps cancellation tokens.
+    * @param trampolineAfter is `true` if the
+    *        [[cats.effect.internals.IORunLoop.RestartCallback]]
+    *        should introduce a trampolined async boundary
+    *        on calling the callback for transmitting the
+    *        signal downstream
+    */
+  private[effect] final case class Async[E, +A](
+                                              k: (IOConnection[E], Either[E, A]  => Unit) => Unit,
+                                              trampolineAfter: Boolean = false)
+    extends BIO[E, A]
+
+  /**
+    * An internal state for that optimizes changes to
+    * [[internals.IOConnection[E]]].
+    *
+    * [[BIO.uncancelable]] is optimized via `ContextSwitch`
+    * and we could express `bracket` in terms of it as well.
+    */
+  private[effect] final case class ContextSwitch[E, A](
+                                                     source: BIO[E, A],
+                                                     modify: IOConnection[E] => IOConnection[E],
+                                                     restore: (A, E, IOConnection[E], IOConnection[E]) => IOConnection[E])
+    extends BIO[E, A]
+
+  /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= */
+
+  /**
+    * Internal reference, used as an optimization for [[BIO.attempt]]
+    * in order to avoid extraneous memory allocations.
+    */
   private object AttemptIO extends IOFrame[Any, Any, BIO[Any, Either[Any, Any]]] {
     override def apply(a: Any) =
       Pure(Right(a))
